@@ -1,0 +1,89 @@
+{
+  "adapterVersion": "0.2.4",
+  "nodeBaseline": "24.21.0",
+  "nodeMajors": {
+    "minimum": 24,
+    "below": 27
+  },
+  "declarationSets": [
+    {
+      "clientVersion": "2.1.299",
+      "sha256": "d5c2ab757a79d3c3e436f6efab0c662519b8344cbc7cd3e8515fbd7db6bc81e8",
+      "source": "docs/research/claude-code-mod-host-spec.md#mod-types"
+    },
+    {
+      "clientVersion": "2.1.308",
+      "sha256": "3c29d70e7f113f2409db12c3db20dd8385296c46aaf26984d00e5ecacd37c2c0",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.308 writes beside a plugin that it loads. The copy of 2.1.308 in Claude Desktop 3.6556.2 writes the same file (docs/implementation/desktop-investigation.md)."
+    },
+    {
+      "clientVersion": "2.1.310",
+      "sha256": "95bd52583669d28e8fefb0675fe48630a4f7cc42a1d3ee22aa445d7998a45334",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.310 writes beside a plugin that it loads"
+    },
+    {
+      "clientVersion": "2.1.311",
+      "sha256": "2701abac34fdfce22b82a29f51bfe5fe729d85de03b6c76f4c7e5eabb5b878b3",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.311 writes beside a plugin that it loads. Against 2.1.310, it adds $.prompt.paint, the backgroundColor of a pane, and notes on the tiers of managed hooks. The Mod uses none of them."
+    },
+    {
+      "clientVersion": "2.1.312",
+      "sha256": "b17c6407f4800426db052491483c4bf0aabc36ce686526fe9b70cd904a821f5a",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.312 writes beside a plugin that it loads. Against 2.1.311, it changes only its version line and the comment on the effort level of a session. The Mod uses neither."
+    }
+  ],
+  "runtimePackages": {
+    "computer": {
+      "@oai/cua-repl": "0.1.2",
+      "@oai/cua": "0.2.6",
+      "@oai/sky": "0.7.13"
+    },
+    "browser": {
+      "@oai/browser-desktop": "0.1.1"
+    }
+  },
+  "liveRecords": [
+    {
+      "record": "docs/implementation/cli-acceptance.json",
+      "result": "pass",
+      "host": "Interactive Claude Code CLI on local macOS",
+      "clientVersion": "2.1.311",
+      "runtimePluginVersion": "26.1021.31345",
+      "packages": {
+        "@oai/cua-repl": "0.1.2",
+        "@oai/cua": "0.2.6",
+        "@oai/sky": "0.7.13"
+      },
+      "surfaces": ["computer"],
+      "appVersion": "26.1021.31345"
+    },
+    {
+      "record": "docs/implementation/browser.md#interactive-check-in-claude-code",
+      "result": "pass",
+      "host": "Interactive Claude Code CLI on local macOS",
+      "clientVersion": "2.1.310",
+      "runtimePluginVersion": "26.1021.31345",
+      "surfaces": ["computer", "browser"]
+    },
+    {
+      "record": "docs/implementation/desktop-acceptance.json",
+      "result": "accepted with documented differences",
+      "host": "Claude Code Desktop 3.6556.2 on local macOS",
+      "clientVersion": "2.1.308",
+      "runtimePluginVersion": "26.1021.31345",
+      "packages": {
+        "@oai/cua-repl": "0.1.2",
+        "@oai/cua": "0.2.6",
+        "@oai/sky": "0.7.13"
+      },
+      "surfaces": ["computer"],
+      "appVersion": "26.1021.31345"
+    }
+  ],
+  "feasibilityOnly": {
+    "clientVersion": "2.1.308",
+    "appVersion": "26.1016.51333",
+    "source": "docs/decisions/0001-live-cua-feasibility.md",
+    "appliesTo": "experiments/feasibility only, not the implementation scaffold"
+  }
+}

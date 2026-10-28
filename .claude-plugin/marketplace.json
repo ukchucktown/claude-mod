@@ -1,0 +1,14 @@
+{
+  "name": "claude-mod",
+  "description": "Claude Code mods by ukchucktown. The first plugin, cua-integration, lets Claude Code operate native macOS apps through the Computer Use runtime of the ChatGPT app.",
+  "owner": {
+    "name": "ukchucktown"
+  },
+  "plugins": [
+    {
+      "name": "cua-integration",
+      "source": "./plugins/cua-integration",
+      "description": "Controls in the interactive CLI and in Claude Code Desktop for the native CUA MCP launcher."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "cua-integration",
+  "version": "0.2.4",
+  "description": "Controls in the interactive CLI and in Claude Code Desktop for the native CUA MCP launcher.",
+  "author": {
+    "name": "ukchucktown"
+  },
+  "types": "./mod/types/index.d.ts",
+  "hooks": "./mod/hooks/hooks.json",
+  "mcpServers": "./mod/.mcp.json"
+}
