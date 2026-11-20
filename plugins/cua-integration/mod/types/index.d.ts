@@ -6,6 +6,11 @@ export type Snapshot = {
   pending: number;
   lastCall: string;
   error?: string;
+  // The plugin version of the launcher, and the version of the launcher
+  // control that read the status. A launcher or a launcher control before
+  // issue #101 gives none.
+  pluginVersion?: string;
+  controlVersion?: string;
   // The review state of the runtime packages, when a runtime exists.
   runtimeReview?: {
     mode: string;
@@ -42,6 +47,9 @@ export type Snapshot = {
     firsts?: Array<{ seq: number; at: string; appName: string }>;
     request?: string;
   };
+  // In the reply to `/cua off`: the request for one stop attempt that
+  // launcher control wrote, or the reason why it wrote none.
+  stop?: { stopId?: string; reason?: string };
   // The last attempt of the launcher to stop the Computer Use service, with
   // its result. Absent before the first attempt.
   nativeService?: {

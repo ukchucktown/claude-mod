@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
+  readFileSync,
   readdirSync,
+  statSync,
   realpathSync,
   rmSync,
   unlinkSync,
@@ -55,9 +57,24 @@ export type Recovery = {
   // starts at the next call of the caller, so the time is absent until then.
   restartedAt?: string;
 };
+// The version of the plugin that holds this module, from its manifest. A
+// launcher writes it to its status. The command line of launcher control,
+// which the Mod runs from its own plugin folder, compares its version with
+// the version of the launcher (issue #101): after an update, a session can
+// run the hooks module of one version with a launcher of another version.
+export const PLUGIN_VERSION: string = JSON.parse(
+  readFileSync(
+    new URL("../.claude-plugin/plugin.json", import.meta.url),
+    "utf8",
+  ),
+).version;
+
 export type ControlStatus = {
   instanceId: string;
   pid: number;
+  // The plugin version of the launcher. A launcher before issue #101 wrote
+  // none.
+  pluginVersion?: string;
   connected: boolean;
   runtimeReady: boolean;
   runtimeGeneration?: string;
@@ -99,7 +116,11 @@ export type ControlStatus = {
   // answers. `request` names the last command that the launcher handled for
   // the mode. The mode lives in the memory of the launcher. This entry is a
   // report, and no reader takes a decision from it.
-  allowAll?: AllowAllStatus & { request?: string };
+  // `generation` is the enable generation that the mode holds while it is
+  // on. Launcher control compares it with the decision file, so a status
+  // from before the launcher wrote the end of the mode never shows the mode
+  // as on.
+  allowAll?: AllowAllStatus & { request?: string; generation?: string };
   // The most recent answers of the Mod, oldest first, each with who answered
   // its dialog as the engine reported it to the Mod. This is evidence for a
   // record. No reader takes a decision from it.
@@ -240,6 +261,7 @@ export class LauncherControl {
     this.status = {
       instanceId: randomUUID(),
       pid: process.pid,
+      pluginVersion: PLUGIN_VERSION,
       connected: true,
       runtimeReady: false,
       active: 0,
@@ -418,7 +440,7 @@ export class LauncherControl {
   // resolves to its identifier. The file is removed once read, so a request
   // starts at most one attempt. A request that another launcher instance
   // received, or one with an unexpected shape, reads as absent.
-  serviceStopRequest(): string | undefined {
+  serviceStopRequest(): { id: string; trigger: "command" | "off" } | undefined {
     if (!existsSync(this.files.serviceStop)) return undefined;
     let record: any;
     try {
@@ -427,10 +449,12 @@ export class LauncherControl {
       record = undefined;
     }
     rmSync(this.files.serviceStop, { force: true });
+    // A request with no trigger is a request of `/cua stop-service` from
+    // launcher control of an earlier version.
     return record?.instanceId === this.status.instanceId &&
       typeof record.id === "string" &&
       OPERATION_ID.test(record.id)
-      ? record.id
+      ? { id: record.id, trigger: record.trigger === "off" ? "off" : "command" }
       : undefined;
   }
   // Takes the request of the Mod for the allow-all mode. The file is removed
@@ -559,6 +583,64 @@ function connectedStatus(files: ReturnType<typeof paths>) {
     throw new Error("The CUA launcher is disconnected");
   return status;
 }
+// The failure for a launcher of another plugin version. The command line of
+// launcher control ends with its own exit code for it, so the Mod prints
+// the message and tries no other session.
+export const VERSION_SKEW_EXIT = 3;
+export class VersionSkew extends Error {}
+// A command that the launcher must read needs a launcher of the version of
+// this module. A launcher of another version can lack the command: it then
+// reads no request, and the person waits for a result that does not come.
+// The check comes before each request file, so no request stays unread.
+// The text names no marketplace as the only one: the public marketplace is
+// `claude-mod`, and a checkout installs the plugin from `claude-cua-dev`.
+function sameVersion(status: ControlStatus) {
+  if (status.pluginVersion === PLUGIN_VERSION) return;
+  const launcher =
+    typeof status.pluginVersion === "string" && status.pluginVersion.length > 0
+      ? status.pluginVersion
+      : "an earlier version";
+  throw new VersionSkew(
+    `The CUA launcher of this session runs plugin version ${launcher}, and this command comes from version ${PLUGIN_VERSION}. Update the plugin from the marketplace where you installed it, for example with claude plugin update cua-integration@claude-mod, or with cua-integration@claude-cua-dev for a checkout. Then quit Claude Code or the Claude desktop app and start it again`,
+  );
+}
+// How long an allow-all request can wait for its launcher. A launcher reads
+// a request at its next poll, which comes many times in one second.
+const REQUEST_STALE_MS = 60_000;
+// Removes each allow-all request that no launcher takes. Before issue #101,
+// a command for a launcher of another version left its request in the
+// control folder, and a later session can have another file prefix. A
+// request is abandoned when its launcher is gone, is another instance, or
+// has another plugin version, and when the request is older than the wait
+// above. A new request for a live launcher of this version stays.
+function sweepRequests(root = defaultRoot()) {
+  let names: string[];
+  try {
+    names = readdirSync(root).filter((name) => name.endsWith(SUFFIX_ALLOW_ALL));
+  } catch {
+    return; // No launcher wrote a control folder yet.
+  }
+  for (const name of names) {
+    const path = join(root, name);
+    let abandoned = true;
+    try {
+      const request = read(path);
+      const status = statusAt(
+        join(root, `${name.slice(0, -SUFFIX_ALLOW_ALL.length)}.status.json`),
+      );
+      abandoned =
+        request?.instanceId !== status.instanceId ||
+        !status.connected ||
+        !live(status.pid) ||
+        status.pluginVersion !== PLUGIN_VERSION ||
+        Date.now() - statSync(path).mtimeMs > REQUEST_STALE_MS;
+    } catch {
+      // A request or a status that cannot be read belongs to no launcher.
+    }
+    if (abandoned) rmSync(path, { force: true });
+  }
+}
+const SUFFIX_ALLOW_ALL = ".allow-all.json";
 // The last status that the launcher of a session wrote, also after that
 // launcher stopped. A stopped launcher keeps there the result of its last
 // attempt to stop the Computer Use service. This function changes no file.
@@ -566,6 +648,7 @@ export function lastStatus(session: string, root?: string): ControlStatus {
   return statusAt(paths(session, root).status);
 }
 export function control(session: string, action: string, root?: string) {
+  sweepRequests(root);
   const files = paths(session, root);
   const status = connectedStatus(files);
   if (!["status", "on", "off"].includes(action))
@@ -584,7 +667,48 @@ export function control(session: string, action: string, root?: string) {
       generation: current ?? randomUUID(),
     });
   }
-  return { ...status, enabled: enabledAt(files.decision, status.instanceId) };
+  // `/cua off` also asks the launcher for one attempt to stop the Computer
+  // Use service (decision record 0006). The request follows the disable, so
+  // no call starts between the two. A request that launcher control cannot
+  // write does not undo the disable: the result names the reason.
+  let stop: { stopId: string } | { reason: string } | undefined;
+  if (action === "off")
+    try {
+      stop = { stopId: queueStop(files, status.instanceId, "off") };
+    } catch (error) {
+      stop = {
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  return {
+    ...current(status, files),
+    enabled: enabledAt(files.decision, status.instanceId),
+    ...(stop ? { stop } : {}),
+    // The version of this module, so the Mod can show a difference from the
+    // version of the launcher.
+    controlVersion: PLUGIN_VERSION,
+  };
+}
+// The status with the allow-all mode as it is now. The launcher writes the
+// end of the mode to its status only at its next poll, and the mode ends
+// with its enable generation, at `/cua off`. Thus, a status that reports the
+// mode as on is correct only while the decision file still has the enable
+// generation of the mode. A status with no generation, from a launcher of an
+// earlier version, reports the mode as on only while the launcher is
+// enabled.
+function current(
+  status: ControlStatus,
+  files: ReturnType<typeof paths>,
+): ControlStatus {
+  const mode = status.allowAll;
+  if (!mode?.on) return status;
+  const generation = generationAt(files.decision, status.instanceId);
+  const on =
+    generation !== undefined &&
+    (mode.generation === undefined || mode.generation === generation);
+  if (on) return status;
+  const { since: _since, generation: _generation, ...rest } = mode;
+  return { ...status, allowAll: { ...rest, on: false } };
 }
 // Asks the connected launcher for one native check and resolves to the
 // identifier of that check. The launcher runs the check as its own operation,
@@ -593,6 +717,7 @@ export function control(session: string, action: string, root?: string) {
 export function check(session: string, root?: string): { checkId: string } {
   const files = paths(session, root);
   const status = connectedStatus(files);
+  sameVersion(status);
   if (!enabledAt(files.decision, status.instanceId))
     throw new Error("CUA is disabled. Run /cua on, then /cua check");
   if (status.nativeCheck?.state === "running")
@@ -619,31 +744,66 @@ export function check(session: string, root?: string): { checkId: string } {
 // own operation and writes the result to its status. The request needs no
 // enabled launcher, because it sends no call, and a person can want to remove
 // an agent pointer while CUA is off.
+// `cleaned` runs after the cleanup of an old request and before the write of
+// the new one, so a test can try a second request at that moment.
 export function serviceStop(
   session: string,
   root?: string,
+  cleaned?: () => void,
 ): { stopId: string } {
   const files = paths(session, root);
   const status = connectedStatus(files);
+  sameVersion(status);
+  return { stopId: queueStop(files, status.instanceId, "command", cleaned) };
+}
+// Writes the request for one stop attempt, with the command that caused it,
+// and returns the identifier of the request. One request waits at a time.
+function queueStop(
+  files: ReturnType<typeof paths>,
+  instanceId: string,
+  trigger: "command" | "off",
+  cleaned?: () => void,
+): string {
   const stopId = randomUUID();
-  // A request of a launcher that stopped names another instance.
+  // Two commands can ask at the same time, for example `/cua off` and
+  // `/cua stop-service`. The cleanup of an old request and the write of the
+  // new one run under one lock, so no command removes the request that
+  // another command wrote between its own read and its own removal.
+  const write = () => {
+    // A request of a launcher that stopped names another instance. An
+    // absent file needs no cleanup.
+    let stale = false;
+    try {
+      stale = read(files.serviceStop)?.instanceId !== instanceId;
+    } catch (error) {
+      stale = (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    if (stale) rmSync(files.serviceStop, { force: true });
+    cleaned?.();
+    try {
+      create(files.serviceStop, { instanceId, id: stopId, trigger });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST")
+        throw new Error(
+          "A stop of the Computer Use service already waits for this launcher",
+        );
+      throw error;
+    }
+  };
   try {
-    if (read(files.serviceStop)?.instanceId !== status.instanceId)
-      rmSync(files.serviceStop, { force: true });
-  } catch {
-    rmSync(files.serviceStop, { force: true });
-  }
-  try {
-    create(files.serviceStop, { instanceId: status.instanceId, id: stopId });
+    locked(files.serviceStop, write, STOP_REQUEST_LOCK_MS);
   } catch (error) {
+    // The lock of another command stayed for the whole wait.
     if ((error as NodeJS.ErrnoException).code === "EEXIST")
       throw new Error(
-        "A stop of the Computer Use service already waits for this launcher",
+        "Another command writes a stop request for this launcher now",
       );
     throw error;
   }
-  return { stopId };
+  return stopId;
 }
+// How long a command waits while another command writes a stop request.
+const STOP_REQUEST_LOCK_MS = 1000;
 // Asks the connected launcher to turn the allow-all mode on or off, and
 // resolves to the identifier of that request. The launcher changes the mode
 // in its memory and writes the result to its status. To turn the mode on,
@@ -656,6 +816,8 @@ export function allowAll(
 ): { requestId: string } {
   const files = paths(session, root);
   const status = connectedStatus(files);
+  sweepRequests(root);
+  sameVersion(status);
   if (on && !enabledAt(files.decision, status.instanceId))
     throw new Error("CUA is disabled. Run /cua on, then /cua allow-all");
   const requestId = randomUUID();
@@ -890,7 +1052,8 @@ export function grants(
 ): GrantList {
   let status: ControlStatus | undefined;
   try {
-    status = connectedStatus(paths(session, root));
+    const files = paths(session, root);
+    status = current(connectedStatus(files), files);
   } catch {
     status = undefined;
   }
@@ -1009,6 +1172,6 @@ if (main) {
     process.stderr.write(
       (error instanceof Error ? error.message : "Control failed") + "\n",
     );
-    process.exitCode = 1;
+    process.exitCode = error instanceof VersionSkew ? VERSION_SKEW_EXIT : 1;
   }
 }

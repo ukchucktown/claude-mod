@@ -59,9 +59,9 @@ The plugin starts disabled in each session.
 1. Run `/cua status`. The status shows the launcher and the runtime.
 2. Run `/cua on` when you want to permit computer-use calls.
 3. Ask Claude to do a task in a native app. Answer each approval dialog.
-4. Run `/cua off` when you want to refuse new calls.
+4. Run `/cua off` when you want to refuse new calls. The command also stops the Computer Use service, which removes its agent pointer from the screen. When a call still uses the computer, the service stays, and the output says so.
 5. Run `/cua allow-all` when you want no approval dialog for the rest of the session. Read the caution below first.
-6. Run `/cua stop-service` when the agent pointer of the Computer Use service stays on the screen after a task.
+6. Run `/cua stop-service` when the agent pointer of the Computer Use service stays on the screen after a task and you want to keep CUA on.
 
 Each dialog offers three choices:
 
@@ -94,7 +94,7 @@ claude plugin marketplace update claude-mod
 claude plugin update cua-integration@claude-mod
 ```
 
-Start a new Claude Code session after the update.
+Run both commands: the first one updates only the list of the marketplace. Then start a new Claude Code session. For Claude Code Desktop, quit the desktop app completely and start it again, because a running session keeps the old version. `/cua status` shows the plugin version, and it tells you when a session runs parts of two versions.
 
 ## Uninstall
 
@@ -107,7 +107,7 @@ claude plugin marketplace remove claude-mod
 
 - A turn end reports cleanup success as unverified, because the runtime suppresses the failures of its own handlers.
 - The native service of the ChatGPT app can keep an app grant after the launcher stops. The plugin does not revoke it.
-- The agent pointer of the Computer Use service can stay on the screen after a turn. Run `/cua stop-service` to stop the service and remove the pointer. The plugin also stops the service when a session that used computer use ends. A Computer Use task of the Codex app that runs at that time loses its service, so do not use computer use in the Codex app and in Claude Code at the same time.
+- The agent pointer of the Computer Use service can stay on the screen after a turn. Run `/cua stop-service` or `/cua off` to stop the service and remove the pointer. The plugin also stops the service when a session that used computer use ends. A Computer Use task of the Codex app that runs at that time loses its service, so do not use computer use in the Codex app and in Claude Code at the same time.
 - In Claude Code Desktop, Esc on an approval dialog ends the turn. The dialog approves nothing.
 
 ## Source

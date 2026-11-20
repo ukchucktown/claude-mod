@@ -7,8 +7,9 @@ import type { ResourceOwnership } from "./ownership.ts";
 // The Computer Use service is the process `SkyComputerUseService` of OpenAI.
 // It makes each native request of a runtime, and it draws the agent pointer.
 // The pointer stays on the screen while the process lives. The launcher stops
-// the process at two events (decision record 0006): when a person runs
-// `/cua stop-service`, and when the launcher stops after it ran a call.
+// the process at three events (decision record 0006): when a person runs
+// `/cua stop-service`, when a person runs `/cua off`, and when the launcher
+// stops after it ran a call.
 // The service starts again at the next native request of a runtime.
 export const SERVICE_PROCESS = "SkyComputerUseService";
 // How long the launcher waits for the exit of the service after the signal.
@@ -16,6 +17,8 @@ export const SERVICE_EXIT_WAIT_MS = 3000;
 // How often the launcher reads the process table during that wait.
 const SERVICE_EXIT_POLL_MS = 50;
 
+// The cause of an attempt. `command` and `off` are commands of a person.
+export type StopTrigger = "command" | "off" | "launcher-stop";
 // The result of one attempt to stop the service. The names give what
 // occurred, not an order of severity.
 // - `stopped`: each signalled process exited.
@@ -40,10 +43,11 @@ export type ServiceStop = {
   // after a refused signal, the processes that the system refused.
   pids?: number[];
   reason?: string;
-  // Why the launcher made the attempt: the command of a person, or the stop
-  // of the launcher. The launcher adds it for the status.
-  trigger?: "command" | "launcher-stop";
-  // The identifier of the request, for an attempt of the command.
+  // Why the launcher made the attempt: the command `/cua stop-service` of a
+  // person, the command `/cua off` of a person, or the stop of the launcher.
+  // The launcher adds it for the status.
+  trigger?: StopTrigger;
+  // The identifier of the request, for an attempt of a command.
   request?: string;
 };
 

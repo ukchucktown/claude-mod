@@ -171,6 +171,19 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = Object.freeze([
     ],
   },
   {
+    id: "large-window",
+    // The binding `getApp` displays the complete accessibility text. For a
+    // browser window with a long page, that result was above the size limit
+    // of a tool result in Claude Code, and the model lost it (issue #103).
+    // The methods of `cua.computer` display nothing. The provider
+    // documentation does not describe them, so the rule gives their form.
+    // The click takes the app identity that the observation returned. The
+    // guard refuses a click with another form of the identity, for example
+    // the bundle identifier, and its refusal names `getApp`.
+    text: "A browser window can have a text too long for one result. Do not bind such a window. In one cell, keep the result of `cua.computer.get_app_state({ app, disableDiff: true })` as state, write only the lines of state.text that you need, and click with `cua.computer.click({ app: state.app, element_index })`.",
+    sources: [record("large-window-runtime.json", "observationWithNoDisplay")],
+  },
+  {
     id: "web-navigation",
     text: "To open a URL, `setValue` the address bar, then `pressKey` Return. After a navigation, observe: the first line names the page.",
     sources: [record("browser-runtime.json", "operations")],

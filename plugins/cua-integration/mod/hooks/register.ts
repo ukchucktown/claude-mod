@@ -129,6 +129,9 @@ class ControlError extends Error {
     this.missing = missing;
   }
 }
+// The exit code of launcher control for a launcher of another plugin
+// version, as `VERSION_SKEW_EXIT` of launcher control defines it.
+const VERSION_SKEW_EXIT = 3;
 const NO_LAUNCHER = [
   "The CUA launcher is disconnected",
   "ENOENT: no such file or directory",
@@ -150,6 +153,11 @@ async function controlRun(
     if (attempt.exitCode === 0 && !attempt.isStdoutTruncated)
       return { value: JSON.parse(attempt.stdout), session };
     failure = attempt.stderr.trim() || failure;
+    // A connected launcher of another plugin version answered. No other
+    // session has the launcher of this session, so the search ends, and
+    // the person reads the two versions and the remedy (issue #101).
+    if (attempt.exitCode === VERSION_SKEW_EXIT)
+      throw new ControlError(failure, false);
     missing &&= NO_LAUNCHER.some((text) => failure.startsWith(text));
   }
   throw new ControlError(failure, missing);
@@ -183,12 +191,17 @@ async function grantList(
   if (fallback) return fallback;
   throw failure;
 }
+// `found`, when given, receives the session of the launcher that answered,
+// so that a follow-up action reaches the same launcher.
 async function snapshot(
   $: EngineInterface,
   action: string,
   known: string[],
+  found?: { session?: string },
 ): Promise<Snapshot> {
-  const value = (await lookup($, [action], known)).value as Snapshot;
+  const reply = await lookup($, [action], known);
+  if (found) found.session = reply.session;
+  const value = reply.value as Snapshot;
   if (
     !value ||
     typeof value.enabled !== "boolean" ||
@@ -337,6 +350,65 @@ function allowAllText(value: Snapshot): string[] {
       : `Allow-all: off. The mode answered ${count} in this launcher${recent}.`,
   ];
 }
+// Waits for the stop attempt that launcher control requested for `/cua off`,
+// and resolves to the status with the result of that attempt. When no
+// attempt ran, or no result came in time, the status has no service entry,
+// so that the report shows no earlier attempt as the result of this command,
+// and the note says why. The launcher stays disabled in each case.
+// The wait asks the launcher that accepted `/cua off`, by its session. A
+// search of the sessions could reach another launcher, which knows no
+// request of this one.
+async function stopAfterOff(
+  $: EngineInterface,
+  disabled: Snapshot,
+  session: string,
+): Promise<{ value: Snapshot; note?: string }> {
+  const { nativeService: _earlier, ...without } = disabled;
+  const none = (reason: string) => ({
+    value: without as Snapshot,
+    note: `Computer Use service: /cua off made no stop attempt that it can report: ${reason}. CUA is disabled. Run /cua stop-service to stop the service.`,
+  });
+  const stop = disabled.stop;
+  if (!stop || typeof stop.stopId !== "string")
+    return none(
+      typeof stop?.reason === "string"
+        ? displayText(stop.reason.replace(/\.$/, ""))
+        : "launcher control sent no request, as with a launcher control of an earlier version",
+    );
+  let result: (Snapshot & { finished?: boolean }) | undefined;
+  try {
+    for (let wait = 0; wait < OFF_STOP_WAITS && !result?.finished; wait++)
+      result = (
+        await controlRun($, ["stop-service-wait", stop.stopId], [session])
+      ).value as Snapshot & { finished?: boolean };
+  } catch (error) {
+    return none(
+      displayText(
+        (error instanceof Error
+          ? error.message
+          : "launcher control failed"
+        ).replace(/\.$/, ""),
+      ),
+    );
+  }
+  if (!result?.finished || serviceText(result).length === 0)
+    return none(
+      "the launcher reported no result in time, as a launcher of an earlier version does",
+    );
+  // The result has the identifier of the request of this command, so
+  // `/cua off` is its cause. A launcher of an earlier version reads the
+  // identifier and not the cause, and its status then names the command
+  // `/cua stop-service`.
+  return {
+    value: {
+      ...result,
+      nativeService: { ...result.nativeService!, trigger: "off" },
+    },
+  };
+}
+// How many times /cua off asks launcher control to wait for the result of
+// its stop attempt. Launcher control waits 10 seconds each time.
+const OFF_STOP_WAITS = 1;
 // How many times /cua stop-service asks launcher control to wait for the
 // result. Launcher control waits 10 seconds each time, and one attempt waits
 // at most 3 seconds for the exit of the service.
@@ -359,9 +431,11 @@ function serviceText(value: Snapshot): string[] {
   const cause =
     stop.trigger === "command"
       ? " after /cua stop-service"
-      : stop.trigger === "launcher-stop"
-        ? " at the stop of the launcher"
-        : "";
+      : stop.trigger === "off"
+        ? " after /cua off"
+        : stop.trigger === "launcher-stop"
+          ? " at the stop of the launcher"
+          : "";
   const line = (result: string) => [
     `Computer Use service: at ${at}${cause}, ${result}`,
   ];
@@ -386,11 +460,31 @@ function serviceText(value: Snapshot): string[] {
       return [];
   }
 }
+// The plugin version of the launcher, and a difference from the version of
+// the commands (issue #101). After an update, a session can run the hooks
+// module of one version with a launcher of another version, and a command
+// of the new version then gets no answer from the old launcher. A status
+// from a launcher control before this change holds neither version, and it
+// shows nothing.
+function versionText(value: Snapshot): string[] {
+  const commands = value.controlVersion;
+  if (typeof commands !== "string") return [];
+  const launcher =
+    typeof value.pluginVersion === "string" && value.pluginVersion.length > 0
+      ? displayText(value.pluginVersion)
+      : "an earlier version";
+  return launcher === commands
+    ? [`Plugin version: ${displayText(commands)}.`]
+    : [
+        `Plugin version: the launcher runs ${launcher}, and the commands come from ${displayText(commands)}. Update the plugin from the marketplace where you installed it, for example with claude plugin update cua-integration@claude-mod, or with cua-integration@claude-cua-dev for a checkout. Then quit Claude Code or the Claude desktop app and start it again.`,
+      ];
+}
 function text(value: Snapshot, registered: boolean): string {
   return [
     `CUA: ${value.enabled ? "enabled" : "disabled"}.`,
     `Tools registered: ${registered ? "yes" : "no"}. Launcher connected: ${value.connected ? "yes" : "no"}. Runtime ready: ${value.runtimeReady ? "yes" : "no"}.`,
     ...recoveryText(value),
+    ...versionText(value),
     ...review(value),
     `Active calls: ${value.active}. Pending approvals: ${value.pending}. Last call: ${value.lastCall}.`,
     ...allowAllText(value),
@@ -500,9 +594,10 @@ async function controlSnapshot(
   action: string,
   known: string[],
   server: string,
+  found?: { session?: string },
 ): Promise<Snapshot> {
   try {
-    return await snapshot($, action, known);
+    return await snapshot($, action, known, found);
   } catch (error) {
     if (!isMissing(error)) throw error;
   }
@@ -519,7 +614,7 @@ async function controlSnapshot(
   }
   for (let poll = 1; ; poll++) {
     try {
-      return await snapshot($, action, known);
+      return await snapshot($, action, known, found);
     } catch (error) {
       if (!isMissing(error) || poll >= WAKE_POLLS) throw error;
     }
@@ -1180,16 +1275,34 @@ export const register: Register = (on) => {
         }
         return { text: checkText(result, approvals.notes) };
       }
-      const value = await controlSnapshot($, action, known, mcpServer);
+      const accepted: { session?: string } = {};
+      let value = await controlSnapshot($, action, known, mcpServer, accepted);
       if (action !== "status")
         await $.store.set("lastEnabledPreference", action === "on");
+      // `/cua off` also asks the launcher for one attempt to stop the
+      // Computer Use service, after the disable. The launcher is disabled
+      // whatever becomes of the attempt, and the report says what became of
+      // it.
+      let unstopped: string | undefined;
+      if (action === "off") {
+        const stopped = await stopAfterOff(
+          $,
+          value,
+          accepted.session ?? (await $.session.id()),
+        );
+        value = stopped.value;
+        unstopped = stopped.note;
+      }
       await display($, value);
       const tools = await $.tool.list();
       return {
-        text: text(
-          value,
-          TOOLS.every((name) => tools.some((tool) => tool.name === name)),
-        ),
+        text: [
+          text(
+            value,
+            TOOLS.every((name) => tools.some((tool) => tool.name === name)),
+          ),
+          ...(unstopped === undefined ? [] : [unstopped]),
+        ].join("\n"),
       };
     },
   ).catch(() => ({

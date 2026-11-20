@@ -278,6 +278,8 @@ export function serve(
   let allowAllRequest: string | undefined;
   // Whether the last published status had the mode on.
   let allowAllOn = false;
+  // The enable generation of the command that turned the mode on.
+  let allowAllBound: string | undefined;
   const publish = () => {
     const recovery = ledger.status();
     const health = main()?.health();
@@ -289,14 +291,20 @@ export function serve(
     ];
     const grants = main()?.grantStatus();
     const current = main() ? versionOf(main()!) : undefined;
+    const allowAllMode = options.allowAll?.allowAllStatus();
     options.control?.publish({
       ...(options.allowAll
         ? {
             allowAll: {
-              ...options.allowAll.allowAllStatus(),
+              ...allowAllMode!,
               ...(allowAllRequest === undefined
                 ? {}
                 : { request: allowAllRequest }),
+              // The enable generation that the mode holds, for readers of
+              // the status between the end of the mode and the next poll.
+              ...(allowAllBound === undefined || !allowAllMode!.on
+                ? {}
+                : { generation: allowAllBound }),
             },
           }
         : {}),
@@ -373,11 +381,13 @@ export function serve(
   // Runtimes that closed and whose processes can still run. Launcher control
   // keeps the session until each of them has exited.
   const closing: Array<Promise<void>> = [];
-  // The launcher stops the Computer Use service at two events (decision
+  // The launcher stops the Computer Use service at three events (decision
   // record 0006), because the agent pointer of the service stays on the
   // screen while the service lives. The launcher never stops the service at
   // a turn end: the person decides when the service stops during a session.
-  // - The command `/cua stop-service` of a person. The attempt needs no call
+  // - The command `/cua stop-service` of a person, and the command
+  //   `/cua off` of a person, which disables the launcher first. Launcher
+  //   control names the command in the request. The attempt needs no call
   //   of this launcher, because the person can want to stop a service that
   //   another product started. While a call of this launcher runs, the
   //   result is `in-use`, and no signal goes out.
@@ -415,7 +425,7 @@ export function serve(
         // The check of the calls and the start of the attempt are in one
         // synchronous step, so no call starts between them.
         result =
-          trigger === "command" && activeCalls > 0
+          trigger !== "launcher-stop" && activeCalls > 0
             ? { at: new Date().toISOString(), outcome: "in-use" }
             : await options.stopService?.();
         result ??= {
@@ -639,13 +649,13 @@ export function serve(
       /* The Mod reports a check that did not start. */
     }
     if (checkId !== undefined) void nativeCheck(checkId);
-    let stopId: string | undefined;
+    let stop: ReturnType<LauncherControl["serviceStopRequest"]>;
     try {
-      stopId = options.control.serviceStopRequest?.();
+      stop = options.control.serviceStopRequest?.();
     } catch {
       /* The Mod reports a request without a result. */
     }
-    if (stopId !== undefined) void attemptStop("command", stopId);
+    if (stop !== undefined) void attemptStop(stop.trigger, stop.id);
     // The allow-all mode (decision record 0007). Only the command of a
     // person changes it, through launcher control. The launcher turns the
     // mode on only while it is enabled, and it binds the mode to the enable
@@ -672,6 +682,7 @@ export function serve(
       if (command) {
         allowAllRequest = command.id;
         const bound = command.on ? generation() : undefined;
+        allowAllBound = bound;
         if (bound === undefined) options.allowAll.setAllowAll(false);
         else options.allowAll.setAllowAll(true, () => generation() === bound);
         allowAllOn = options.allowAll.allowAllStatus().on;
