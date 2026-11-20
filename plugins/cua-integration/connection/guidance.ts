@@ -109,7 +109,7 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = Object.freeze([
   },
   {
     id: "text-observation",
-    text: "Work from the accessibility text. When it identifies the controls, a missing or unreadable image is no blocker.",
+    text: "When the accessibility text identifies the controls, a missing or unreadable image is no blocker.",
     sources: [record("guidance-runtime.json", "observationWithScreenshot")],
   },
   {
@@ -129,7 +129,7 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = Object.freeze([
   },
   {
     id: "one-app-failure",
-    text: "A failure for one app or window does not show that Computer Use is unavailable. The brackets at the end of the message name its origin. Continue with the other apps, and report the message.",
+    text: "A failure for one app or window does not show that Computer Use is unavailable. Its brackets name the origin. Continue with the other apps, and report the message.",
     sources: [
       record("guidance-runtime.json", "failureOfAnotherApp"),
       guard(
@@ -151,6 +151,13 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = Object.freeze([
           "ADAPTER-RESULT / ADAPTER-REVIEWER: explicit user scope only, no manufactured provenance",
       },
     ],
+  },
+  {
+    id: "quit-check",
+    // An observation starts an app that does not run (issue #93). A model
+    // that observes an app to check its quit thus opens the app again.
+    text: "After you quit an app, do not observe it: that starts it again.",
+    sources: [record("app-lifecycle-runtime.json", "apps")],
   },
   // For the launcher, a browser is a native app (issue #81). The four rules
   // for a browser come last, because they apply to one kind of app. Each of
@@ -181,7 +188,7 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = Object.freeze([
 ]);
 
 const INTRODUCTION =
-  "Rules of the claude-cua launcher. They add to the documentation in the first `js` result and apply where it differs. The launcher refuses an input that breaks an input rule.";
+  "These rules add to the documentation in the first `js` result and apply where it differs. The launcher refuses an input that breaks an input rule.";
 
 // The guidance text.
 export function guidance(): string {

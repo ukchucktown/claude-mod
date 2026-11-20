@@ -53,6 +53,29 @@ export function create(path: string, data: unknown) {
     unlinkSync(temporary);
   }
 }
+// Takes a message file: claims it, reads it, and removes it. The claim is a
+// rename to a path that no writer uses, and a rename is atomic. A writer
+// that replaces the message during the read thus writes a new file, which
+// the next call takes. Without the claim, a read and a later removal could
+// read one message and remove a newer one.
+// Returns undefined when no message exists, and throws when the claimed
+// file is unsafe or unreadable. `claimed` runs after the claim and before
+// the read, so a test can write a newer message at that moment.
+export function take(path: string, claimed?: () => void): any {
+  const own = `${path}.${randomUUID()}.taken`;
+  try {
+    renameSync(path, own);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  try {
+    claimed?.();
+    return read(own);
+  } finally {
+    rmSync(own, { force: true });
+  }
+}
 export function live(pid: unknown): boolean {
   if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return false;
   try {

@@ -42,6 +42,7 @@ if (!nonempty(sessionId)) {
         ownership,
       });
     },
+    allowAll: grants,
     stopService: async () =>
       service === undefined ? undefined : stopService(service, ownership),
     // A stopped server releases stdin so the process can exit.

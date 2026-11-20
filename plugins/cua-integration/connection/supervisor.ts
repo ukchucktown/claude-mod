@@ -745,8 +745,13 @@ export class RuntimeSupervisor implements ConnectionOwner {
     }
     // A session grant answers with a plain accept. The native wrapper still
     // receives that accept and applies its own checks to the operation.
-    if (this.reusable(execution.caller, approval)) {
-      this.reused++;
+    const automatic = this.automatic(execution.caller, approval);
+    if (automatic !== undefined) {
+      // The allow-all mode answers a request that no session grant answers.
+      // It is the answer of the person in advance, so the runtime receives
+      // the same plain accept, with no persistence.
+      if (automatic === "grant") this.reused++;
+      else this.options.grants!.recordAllowed(approval);
       this.host.answer(request.id, { action: "accept", content: {} });
       try {
         this.onGrantReused?.();
@@ -806,16 +811,25 @@ export class RuntimeSupervisor implements ConnectionOwner {
       /* A failing listener cannot change the decision already sent. */
     }
   }
-  // A grant never answers for a call that its client abandoned, or while the
-  // launcher gate refuses dispatch. A failed check asks the user instead.
-  private reusable(caller: Caller, approval: NativeApproval): boolean {
-    if (!this.options.grants || this.abandoned.has(caller.toolUseId))
-      return false;
+  // What answers this request with no dialog: a session grant, the allow-all
+  // mode, or nothing. Neither answers for a call that its client abandoned,
+  // or while the launcher gate refuses dispatch. A failed check asks the
+  // user instead.
+  private automatic(
+    caller: Caller,
+    approval: NativeApproval,
+  ): "grant" | "allow-all" | undefined {
+    const grants = this.options.grants;
+    if (!grants || this.abandoned.has(caller.toolUseId)) return undefined;
     try {
       this.options.beforeDispatch?.();
-      return this.options.grants.reuse(approval);
+      return grants.reuse(approval)
+        ? "grant"
+        : grants.allowsAll(approval)
+          ? "allow-all"
+          : undefined;
     } catch {
-      return false;
+      return undefined;
     }
   }
   // Marks a call that its client gave up while it waited for app access.

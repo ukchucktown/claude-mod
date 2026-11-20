@@ -17,6 +17,7 @@ import type {
 import {
   legacyGrantStore,
   resource,
+  type AllowAllStatus,
   type LegacyGrantStore,
   type SessionGrant,
 } from "../policy/grants.ts";
@@ -26,6 +27,7 @@ import {
   locked,
   privateDirectory,
   read,
+  take,
   write,
 } from "../private-files.ts";
 import type { FailureCategory } from "./diagnostics.ts";
@@ -92,6 +94,12 @@ export type ControlStatus = {
   // reader takes a decision from them.
   reusedGrants?: number;
   sessionGrants?: SessionGrant[];
+  // The allow-all mode of this launcher (decision record 0007): whether it
+  // is on, how many requests it answered with no dialog, and the most recent
+  // answers. `request` names the last command that the launcher handled for
+  // the mode. The mode lives in the memory of the launcher. This entry is a
+  // report, and no reader takes a decision from it.
+  allowAll?: AllowAllStatus & { request?: string };
   // The most recent answers of the Mod, oldest first, each with who answered
   // its dialog as the engine reported it to the Mod. This is evidence for a
   // record. No reader takes a decision from it.
@@ -134,6 +142,8 @@ function paths(session: string, root = defaultRoot()) {
     lifecycle: join(root, `${key}.lifecycle.`),
     // The request of the Mod for one native check.
     check: join(root, `${key}.check.json`),
+    // The request of the Mod to turn the allow-all mode on or off.
+    allowAll: join(root, `${key}.allow-all.json`),
     // The request of the Mod for one stop of the Computer Use service.
     serviceStop: join(root, `${key}.service-stop.json`),
     // The next lifecycle sequence number for this session.
@@ -195,6 +205,21 @@ function statusAt(path: string): ControlStatus {
   )
     throw new Error("Malformed launcher status");
   return status;
+}
+// The enable generation in a decision file, or undefined when the file does
+// not enable this launcher instance or names no generation.
+function generationAt(path: string, instanceId: string): string | undefined {
+  try {
+    const decision = read(path);
+    return decision.instanceId === instanceId &&
+      decision.enabled === true &&
+      typeof decision.generation === "string" &&
+      OPERATION_ID.test(decision.generation)
+      ? decision.generation
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 function enabledAt(path: string, instanceId: string): boolean {
   try {
@@ -408,6 +433,38 @@ export class LauncherControl {
       ? record.id
       : undefined;
   }
+  // Takes the request of the Mod for the allow-all mode. The file is removed
+  // once read, so the launcher handles a request at most once. A request
+  // that another launcher instance received, or one with an unexpected
+  // shape, reads as absent. The file is a message only: the mode lives in
+  // the memory of the launcher.
+  allowAllRequest(): { id: string; on: boolean } | undefined {
+    let record: any;
+    try {
+      // A later command replaces the file, so the launcher claims the file
+      // before it reads it. A command that arrives during the read stays
+      // for the next call.
+      record = take(this.files.allowAll);
+    } catch {
+      record = undefined;
+    }
+    return record?.instanceId === this.status.instanceId &&
+      typeof record.id === "string" &&
+      OPERATION_ID.test(record.id) &&
+      typeof record.on === "boolean"
+      ? { id: record.id, on: record.on }
+      : undefined;
+  }
+  // The enable generation of this launcher: the identifier of the `/cua on`
+  // that enabled it, or undefined while it is disabled. Each `/cua off`
+  // ends a generation, and the next `/cua on` starts another one. A second
+  // `/cua on` of an enabled launcher keeps the generation. The allow-all
+  // mode holds the generation under which the person turned it on, so the
+  // mode ends at `/cua off`, also when `/cua on` follows at once.
+  enableGeneration(): string | undefined {
+    if (this.closed || this.broken) return undefined;
+    return generationAt(this.files.decision, this.status.instanceId);
+  }
   close() {
     if (this.closed) return;
     try {
@@ -426,7 +483,11 @@ export class LauncherControl {
     } catch {
       /* Leftover records name this instance and cannot act for another. */
     }
-    for (const request of [this.files.check, this.files.serviceStop])
+    for (const request of [
+      this.files.check,
+      this.files.serviceStop,
+      this.files.allowAll,
+    ])
       try {
         rmSync(request, { force: true });
       } catch {
@@ -443,6 +504,15 @@ export class LauncherControl {
         active: 0,
         pending: 0,
         sessionGrants: [],
+        // The mode ends with this launcher.
+        ...(this.status.allowAll
+          ? {
+              allowAll: (({ since: _since, ...rest }) => ({
+                ...rest,
+                on: false,
+              }))(this.status.allowAll),
+            }
+          : {}),
         nativePermission: UNVERIFIED,
       });
     } finally {
@@ -500,11 +570,20 @@ export function control(session: string, action: string, root?: string) {
   const status = connectedStatus(files);
   if (!["status", "on", "off"].includes(action))
     throw new Error("Use status, on, or off");
-  if (action !== "status")
+  if (action !== "status") {
+    // An enabled launcher keeps its enable generation at a second `/cua on`.
+    // Each other change starts a generation, so no state that is bound to an
+    // earlier `/cua on` survives a `/cua off`.
+    const current =
+      action === "on"
+        ? generationAt(files.decision, status.instanceId)
+        : undefined;
     write(files.decision, {
       instanceId: status.instanceId,
       enabled: action === "on",
+      generation: current ?? randomUUID(),
     });
+  }
   return { ...status, enabled: enabledAt(files.decision, status.instanceId) };
 }
 // Asks the connected launcher for one native check and resolves to the
@@ -564,6 +643,45 @@ export function serviceStop(
     throw error;
   }
   return { stopId };
+}
+// Asks the connected launcher to turn the allow-all mode on or off, and
+// resolves to the identifier of that request. The launcher changes the mode
+// in its memory and writes the result to its status. To turn the mode on,
+// the launcher must be enabled, because the mode permits calls to act on
+// each app. To turn it off, it need not be.
+export function allowAll(
+  session: string,
+  on: boolean,
+  root?: string,
+): { requestId: string } {
+  const files = paths(session, root);
+  const status = connectedStatus(files);
+  if (on && !enabledAt(files.decision, status.instanceId))
+    throw new Error("CUA is disabled. Run /cua on, then /cua allow-all");
+  const requestId = randomUUID();
+  // A later request replaces an earlier one that the launcher did not read
+  // yet, so the last command of the person decides.
+  write(files.allowAll, { instanceId: status.instanceId, id: requestId, on });
+  return { requestId };
+}
+// How long one `allow-all-wait` command waits for the launcher.
+export const ALLOW_ALL_WAIT_MS = 5000;
+// Waits until the launcher handled the request `requestId`, at most
+// `waitMs`, and resolves to the status then. `finished` is false when the
+// wait ended first. A launcher that stops ends the wait with an error.
+export function allowAllWait(
+  session: string,
+  requestId: string,
+  root?: string,
+  waitMs = ALLOW_ALL_WAIT_MS,
+) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const status = control(session, "status", root);
+    const finished = status.allowAll?.request === requestId;
+    if (finished || Date.now() >= deadline) return { ...status, finished };
+    Atomics.wait(pause, 0, 0, CHECK_WAIT_POLL_MS);
+  }
 }
 // How long one `stop-service-wait` command waits for the result. An attempt
 // waits at most 3 seconds for the exit of the service.
@@ -634,6 +752,13 @@ export function checkWait(
     if (finished || Date.now() >= deadline) return { ...status, finished };
     Atomics.wait(pause, 0, 0, CHECK_WAIT_POLL_MS);
   }
+}
+// The first answer of the allow-all mode for each app, as the connected
+// launcher holds them for the notice of the Mod.
+// A report only: no reader takes a decision from it.
+export function allowed(session: string, root?: string) {
+  const firsts = connectedStatus(paths(session, root)).allowAll?.firsts;
+  return Array.isArray(firsts) ? firsts : [];
 }
 // The approvals that the connected launcher waits on. A list that another
 // launcher instance wrote is not this launcher's, so it reads as empty.
@@ -745,6 +870,8 @@ export type GrantList = {
   // The session grants of the connected launcher.
   session: SessionGrant[];
   launcherConnected: boolean;
+  // The allow-all mode of the connected launcher, when it is on.
+  allowAll?: { since: string; answered: number };
   // The grant store of issue #12, when the file still exists. No launcher
   // reads it.
   legacyStore?: LegacyGrantStore;
@@ -779,6 +906,16 @@ export function grants(
           }))
       : [],
     launcherConnected: status !== undefined,
+    ...(status?.allowAll?.on === true &&
+    typeof status.allowAll.since === "string" &&
+    Number.isSafeInteger(status.allowAll.answered)
+      ? {
+          allowAll: {
+            since: status.allowAll.since,
+            answered: status.allowAll.answered,
+          },
+        }
+      : {}),
     ...(store ? { legacyStore: store } : {}),
   };
 }
@@ -817,6 +954,15 @@ function run(argv: string[]): unknown {
     return check(session);
   if (session !== undefined && action === "check-wait" && rest.length === 1)
     return checkWait(session, rest[0]!);
+  if (
+    session !== undefined &&
+    action === "allow-all" &&
+    rest.length === 1 &&
+    ["on", "off"].includes(rest[0]!)
+  )
+    return allowAll(session, rest[0] === "on");
+  if (session !== undefined && action === "allow-all-wait" && rest.length === 1)
+    return allowAllWait(session, rest[0]!);
   if (session !== undefined && action === "stop-service" && rest.length === 0)
     return serviceStop(session);
   if (
@@ -825,8 +971,11 @@ function run(argv: string[]): unknown {
     rest.length === 1
   )
     return serviceStopWait(session, rest[0]!);
+  // The Mod reads the offers during a call. The answers of the allow-all
+  // mode come with them, so the Mod can show a notice for an app that the
+  // mode approved.
   if (session !== undefined && action === "approvals" && rest.length === 0)
-    return { approvals: approvals(session) };
+    return { approvals: approvals(session), allowed: allowed(session) };
   if (session !== undefined && action === "grants" && rest.length === 0)
     return grants(session);
   if (
@@ -838,7 +987,7 @@ function run(argv: string[]): unknown {
   if (session !== undefined && action !== undefined && rest.length === 0)
     return control(session, action);
   throw new Error(
-    "Usage: control.ts SESSION status|on|off|approvals|grants|check|stop-service, control.ts SESSION check-wait CHECK_ID, control.ts SESSION stop-service-wait STOP_ID, control.ts SESSION answer OPERATION_ID CHOICE [person|host|none], control.ts SESSION call TOOL_USE_ID TURN_ID CONVERSATION [AGENT_ID], control.ts SESSION turn-end TURN_ID answer|aborted [AGENT_ID], or control.ts SESSION session-end clear|resume CONVERSATION",
+    "Usage: control.ts SESSION status|on|off|approvals|grants|check|stop-service, control.ts SESSION allow-all on|off, control.ts SESSION allow-all-wait REQUEST_ID, control.ts SESSION check-wait CHECK_ID, control.ts SESSION stop-service-wait STOP_ID, control.ts SESSION answer OPERATION_ID CHOICE [person|host|none], control.ts SESSION call TOOL_USE_ID TURN_ID CONVERSATION [AGENT_ID], control.ts SESSION turn-end TURN_ID answer|aborted [AGENT_ID], or control.ts SESSION session-end clear|resume CONVERSATION",
   );
 }
 // A path through a symlink, such as a linked home directory, names the same

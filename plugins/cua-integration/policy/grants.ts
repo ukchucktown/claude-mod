@@ -35,10 +35,122 @@ export const resource = (value: unknown): value is string =>
 const covers = (granted: Risk, requested: Risk) =>
   granted === "high" || requested === "low";
 
-// The session grants of one launcher. The runtimes of all callers share them,
-// and they end with the launcher process.
+// How many answers of the allow-all mode the status keeps.
+export const ALLOW_ALL_HISTORY = 10;
+// How many first answers for an app the status keeps for the notice of the
+// Mod. This list is separate from the recent answers, so later answers for
+// one app do not remove the first answer for another app before the Mod
+// showed it.
+export const ALLOW_ALL_FIRSTS = 64;
+// One request that the allow-all mode answered.
+export type AllowAllAnswer = {
+  // The number of the answer in this launcher, from 1.
+  seq: number;
+  at: string;
+  resource: string;
+  appName: string;
+  operation: string;
+  riskLevel: Risk;
+  // True for the first answer for this app since the mode went on.
+  firstForApp: boolean;
+};
+// The allow-all mode of one launcher (decision record 0007): whether it is
+// on, since when, how many requests it answered in this launcher, and the
+// most recent answers, oldest first.
+export type AllowAllStatus = {
+  on: boolean;
+  since?: string;
+  answered: number;
+  recent: AllowAllAnswer[];
+  // The first answer for each app since the mode went on, oldest first, for
+  // the notice of the Mod. The list keeps the most recent entries.
+  firsts: AllowAllAnswer[];
+};
+
+// The session grants of one launcher, and its allow-all mode. The runtimes of
+// all callers share them, and they end with the launcher process. Nothing
+// here reads or writes a file.
 export class SessionGrants {
   private grants = new Map<string, SessionGrant>();
+  // The allow-all mode: an answer of the person in advance, for each app. It
+  // is on only between the command of a person that turns it on and the
+  // command that turns it off, and a new launcher starts with the mode off.
+  private all:
+    | { since: string; apps: Set<string>; valid: () => boolean }
+    | undefined;
+  private answered = 0;
+  private recent: AllowAllAnswer[] = [];
+  private firsts: AllowAllAnswer[] = [];
+  // Turns the mode on or off. Returns whether the state changed. `valid`
+  // binds the mode to a condition of the launcher: the mode ends at the
+  // first use or report for which the condition is false. The launcher
+  // binds the mode to the enable generation of the `/cua on` under which
+  // the person turned the mode on, so each `/cua off` ends the mode.
+  setAllowAll(on: boolean, valid: () => boolean = () => true): boolean {
+    if (!on) {
+      if (this.all === undefined) return false;
+      this.all = undefined;
+      return true;
+    }
+    // A second command keeps the start time and takes the new condition.
+    if (this.all !== undefined) {
+      this.all.valid = valid;
+      return false;
+    }
+    this.all = { since: new Date().toISOString(), apps: new Set(), valid };
+    return true;
+  }
+  // The mode, after a check of its condition. A condition that is false, or
+  // that fails, ends the mode.
+  private mode() {
+    if (this.all === undefined) return undefined;
+    let valid = false;
+    try {
+      valid = this.all.valid();
+    } catch {
+      valid = false;
+    }
+    if (!valid) this.all = undefined;
+    return this.all;
+  }
+  // Whether the mode answers this request now. The mode answers exactly the
+  // requests that a session grant can answer: the request must permit
+  // session persistence. The risk level does not matter, because the person
+  // answered for each app and each operation.
+  allowsAll(approval: NativeApproval): boolean {
+    return this.mode() !== undefined && approval.scopes.includes("session");
+  }
+  // Records one request that the mode answered. The mode keeps no session
+  // grant for the app, so the dialog returns when the mode goes off.
+  recordAllowed(approval: NativeApproval): AllowAllAnswer {
+    const answer: AllowAllAnswer = {
+      seq: ++this.answered,
+      at: new Date().toISOString(),
+      resource: approval.appId,
+      appName: approval.appName,
+      operation: approval.operation,
+      riskLevel: approval.riskLevel,
+      firstForApp: !(this.all?.apps.has(approval.appId) ?? false),
+    };
+    this.all?.apps.add(approval.appId);
+    this.recent.push(answer);
+    if (this.recent.length > ALLOW_ALL_HISTORY) this.recent.shift();
+    if (answer.firstForApp) {
+      this.firsts.push(answer);
+      if (this.firsts.length > ALLOW_ALL_FIRSTS) this.firsts.shift();
+    }
+    return answer;
+  }
+  allowAllStatus(): AllowAllStatus {
+    const mode = this.mode();
+    return {
+      on: mode !== undefined,
+      ...(mode ? { since: mode.since } : {}),
+      answered: this.answered,
+      recent: structuredClone(this.recent),
+      firsts: structuredClone(this.firsts),
+    };
+  }
   // Whether a session grant answers this request now. The request must still
   // permit session persistence, so a policy change that withdraws it also
   // withdraws reuse.

@@ -17,6 +17,7 @@ import {
   type Request,
 } from "./protocol.ts";
 import type { ServiceStop } from "./service.ts";
+import type { SessionGrants } from "../policy/grants.ts";
 import { PROTOCOL_VERSION, RuntimeSupervisor } from "./supervisor.ts";
 import { failureCategory, resultCategory } from "./diagnostics.ts";
 import {
@@ -200,7 +201,18 @@ export function serve(
       | "caller"
       | "lifecycle"
     > &
-      Partial<Pick<LauncherControl, "checkRequest" | "serviceStopRequest">>;
+      Partial<
+        Pick<
+          LauncherControl,
+          | "checkRequest"
+          | "serviceStopRequest"
+          | "allowAllRequest"
+          | "enableGeneration"
+        >
+      >;
+    // The allow-all mode of the launcher, which lives with its session
+    // grants. Without it, the launcher has no mode.
+    allowAll?: Pick<SessionGrants, "setAllowAll" | "allowAllStatus">;
     // How often the launcher checks for the Mod's answer while an approval waits.
     answerPollMs?: number;
     // How often the launcher checks for lifecycle events that the Mod relays.
@@ -262,6 +274,10 @@ export function serve(
   // that caller replaces it. Thus, the status shows the failure until then.
   const hasFailed = (runtime: Runtime) =>
     runtime.owner.health().state === "failed";
+  // The last command for the allow-all mode that this launcher handled.
+  let allowAllRequest: string | undefined;
+  // Whether the last published status had the mode on.
+  let allowAllOn = false;
   const publish = () => {
     const recovery = ledger.status();
     const health = main()?.health();
@@ -274,6 +290,16 @@ export function serve(
     const grants = main()?.grantStatus();
     const current = main() ? versionOf(main()!) : undefined;
     options.control?.publish({
+      ...(options.allowAll
+        ? {
+            allowAll: {
+              ...options.allowAll.allowAllStatus(),
+              ...(allowAllRequest === undefined
+                ? {}
+                : { request: allowAllRequest }),
+            },
+          }
+        : {}),
       ...(current ? { runtimeVersion: current } : {}),
       ...(checking
         ? { nativeCheck: { id: checking.id, state: "running" as const } }
@@ -620,6 +646,42 @@ export function serve(
       /* The Mod reports a request without a result. */
     }
     if (stopId !== undefined) void attemptStop("command", stopId);
+    // The allow-all mode (decision record 0007). Only the command of a
+    // person changes it, through launcher control. The launcher turns the
+    // mode on only while it is enabled, and it binds the mode to the enable
+    // generation of that moment. The mode checks the generation before each
+    // answer and each report, so each /cua off ends the mode, also when
+    // /cua on follows before the next poll. The status reports each handled
+    // command with its identifier.
+    if (options.allowAll) {
+      const control = options.control;
+      const generation = () => {
+        try {
+          control.assertEnabled();
+          return control.enableGeneration?.();
+        } catch {
+          return undefined;
+        }
+      };
+      let command: { id: string; on: boolean } | undefined;
+      try {
+        command = control.allowAllRequest?.();
+      } catch {
+        /* The Mod reports a command without a result. */
+      }
+      if (command) {
+        allowAllRequest = command.id;
+        const bound = command.on ? generation() : undefined;
+        if (bound === undefined) options.allowAll.setAllowAll(false);
+        else options.allowAll.setAllowAll(true, () => generation() === bound);
+        allowAllOn = options.allowAll.allowAllStatus().on;
+        tryPublish();
+      } else if (options.allowAll.allowAllStatus().on !== allowAllOn) {
+        // The mode ended at a check of its generation.
+        allowAllOn = options.allowAll.allowAllStatus().on;
+        tryPublish();
+      }
+    }
     let requests: LifecycleRequest[] = [];
     try {
       requests = options.control.lifecycle();

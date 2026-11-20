@@ -24,6 +24,24 @@ export type Snapshot = {
       restartedAt?: string;
     }>;
   };
+  // The allow-all mode of the launcher: whether it is on, how many app
+  // requests it answered with no dialog, and the most recent answers.
+  allowAll?: {
+    on: boolean;
+    since?: string;
+    answered: number;
+    recent?: Array<{
+      seq: number;
+      at: string;
+      resource: string;
+      appName: string;
+      operation: string;
+      firstForApp?: boolean;
+    }>;
+    // The first answer for each app, for the notice of the Mod.
+    firsts?: Array<{ seq: number; at: string; appName: string }>;
+    request?: string;
+  };
   // The last attempt of the launcher to stop the Computer Use service, with
   // its result. Absent before the first attempt.
   nativeService?: {
@@ -82,6 +100,8 @@ export type Offer = {
 export type GrantList = {
   session: Array<{ resource: string; appName: string; riskLevel: string }>;
   launcherConnected: boolean;
+  // The allow-all mode of the connected launcher, when it is on.
+  allowAll?: { since: string; answered: number };
   legacyStore?: { path: string; apps?: string[] };
 };
 declare module "claude-code" {

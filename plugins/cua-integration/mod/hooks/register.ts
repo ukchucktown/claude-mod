@@ -204,7 +204,7 @@ async function snapshot(
 async function display($: EngineInterface, value: Snapshot) {
   await $.state.set(REF, value);
   $.ui.status(
-    `CUA ${value.enabled ? "on" : "off"} | ${value.pending ? "approval pending" : value.active ? "active" : value.lastCall === "failed" ? "failed" : value.runtimeReady ? "runtime ready" : "not ready"}`,
+    `CUA ${value.enabled ? "on" : "off"}${value.enabled && value.allowAll?.on === true ? " | allow-all" : ""} | ${value.pending ? "approval pending" : value.active ? "active" : value.lastCall === "failed" ? "failed" : value.runtimeReady ? "runtime ready" : "not ready"}`,
   );
 }
 // The review state of the runtime packages. An unreviewed package version
@@ -300,6 +300,43 @@ function recoveryText(value: Snapshot): string[] {
     `Last runtime failure: ${displayText(last.at)}, reason ${displayText(last.reason)}, runtime of ${last.caller === "main" ? "the main loop" : "a subagent"}. ${typeof last.restartedAt === "string" ? `A new runtime started at ${displayText(last.restartedAt)}.` : "No new runtime started yet. It starts at the next call of that caller."}`,
   ];
 }
+const USAGE =
+  "Usage: /cua [on|off|status|check|grants|stop-service|allow-all [off]]";
+// How many times /cua allow-all asks launcher control to wait for the
+// launcher. Launcher control waits 5 seconds each time.
+const ALLOW_ALL_WAITS = 2;
+// The reports of /cua allow-all. The first one states in plain words what
+// the mode permits.
+const ALLOW_ALL_ON =
+  "CUA allow-all: on. Until this launcher stops, each app request gets an approval with no dialog. Claude can thus observe and operate each app on this Mac that the Codex app does not refuse, with no further question.\nRun /cua allow-all off or /cua off to end the mode.";
+const ALLOW_ALL_OFF =
+  "CUA allow-all: off. A request for an app with no session grant opens a dialog again.";
+// The allow-all line of the status: whether the mode is on, how many app
+// requests it answered with no dialog, and the most recent one. The strings
+// come from the launcher status, so each one shows through displayText.
+function allowAllText(value: Snapshot): string[] {
+  const mode = value.allowAll;
+  if (
+    !mode ||
+    typeof mode.on !== "boolean" ||
+    !Number.isSafeInteger(mode.answered)
+  )
+    return [];
+  if (!mode.on && mode.answered === 0) return [];
+  const last = Array.isArray(mode.recent) ? mode.recent.at(-1) : undefined;
+  const recent =
+    last &&
+    typeof last.appName === "string" &&
+    typeof last.operation === "string"
+      ? `, most recently ${displayText(last.appName)} (${displayText(last.operation)})`
+      : "";
+  const count = `${mode.answered} app request${mode.answered === 1 ? "" : "s"}`;
+  return [
+    mode.on
+      ? `Allow-all: on${typeof mode.since === "string" ? ` since ${displayText(mode.since)}` : ""}. Each app request gets an approval with no dialog. The mode answered ${count}${recent}. Run /cua allow-all off to end it.`
+      : `Allow-all: off. The mode answered ${count} in this launcher${recent}.`,
+  ];
+}
 // How many times /cua stop-service asks launcher control to wait for the
 // result. Launcher control waits 10 seconds each time, and one attempt waits
 // at most 3 seconds for the exit of the service.
@@ -356,6 +393,7 @@ function text(value: Snapshot, registered: boolean): string {
     ...recoveryText(value),
     ...review(value),
     `Active calls: ${value.active}. Pending approvals: ${value.pending}. Last call: ${value.lastCall}.`,
+    ...allowAllText(value),
     ...permissionText(value),
     ...serviceText(value),
     "Task completion: unverified. A completed call does not prove a completed task.",
@@ -492,6 +530,25 @@ async function controlSnapshot(
 // now. The interactive terminal always has them, also while a remote client
 // is attached. An SDK start has them only while Desktop is its only surface,
 // so a -p run, another SDK host, and the VS Code panel never connect.
+// A /cua command can run before the session is ready for it (issue #92).
+// The start hook of the Mod is asynchronous, and Claude Code Desktop attaches
+// its client only after the session start, so a command at the start of a
+// session can find no completed start and no surface. The command waits this
+// long for both, in steps, before it answers.
+const STARTUP_WAIT_MS = 3000;
+const STARTUP_POLL_MS = 100;
+const STARTING =
+  "CUA is not ready: the session still starts. Run the command again.";
+const UNATTACHED =
+  "CUA is not ready: no client is attached to this session. In Claude Code Desktop, run the command again when the session shows. A session with no client, such as a headless run, is unsupported.";
+// Whether an SDK start has no client yet. Desktop attaches after the start,
+// and a headless run never attaches one. A failed query ends the wait, and
+// the surface check then refuses.
+const unattached = async ($: EngineInterface) =>
+  $.session.surfaces().then(
+    (surfaces) => surfaces.length === 0,
+    () => false,
+  );
 async function controlsAvailable($: EngineInterface, start: Start | undefined) {
   if (start === "terminal") return true;
   if (start !== "sdk") return false;
@@ -576,6 +633,13 @@ function grantText(list: GrantList): string {
     list.launcherConnected
       ? `Session grants of this launcher: ${list.session.length === 0 ? "none" : list.session.map((grant) => `${displayText(grant.appName)} (${displayText(grant.resource)})`).join(", ")}. Each ends when the CUA launcher stops, for example at a /mcp reconnect or at Claude Code exit.`
       : "Session grants: none, because the CUA launcher is disconnected.",
+    ...(list.allowAll &&
+    typeof list.allowAll.since === "string" &&
+    Number.isSafeInteger(list.allowAll.answered)
+      ? [
+          `Allow-all mode: on since ${displayText(list.allowAll.since)}. Each app request gets an approval with no dialog, for each app, until the CUA launcher stops or you run /cua allow-all off. It answered ${list.allowAll.answered} request${list.allowAll.answered === 1 ? "" : "s"}.`,
+        ]
+      : []),
     LASTING,
     ...(legacy
       ? [
@@ -728,6 +792,35 @@ async function present(
 // no new dialog opens after it. A dialog that is already open still sends its
 // answer, and the launcher refuses an answer for a request that ended. notes
 // holds the reason for each cancel.
+// The first answers of the allow-all mode for an app that the Mod already
+// showed, by time and number. The set survives a call, so each answer gets
+// at most one notice. It keeps the most recent keys only.
+const noticed = new Set<string>();
+const NOTICED_LIMIT = 256;
+// Shows one notice for each first answer of the allow-all mode for an app
+// that the Mod did not show yet. The launcher answered these requests with
+// no dialog, so the notice informs and asks nothing. The Mod reads the list
+// with the approval offers during a call, and again in the status after the
+// call, so an answer between two reads of a call still gets its notice.
+function notice($: EngineInterface, firsts: unknown) {
+  for (const answer of Array.isArray(firsts) ? firsts : []) {
+    const key =
+      answer &&
+      typeof answer.at === "string" &&
+      Number.isSafeInteger(answer.seq)
+        ? `${answer.at} ${answer.seq}`
+        : undefined;
+    if (key === undefined || noticed.has(key)) continue;
+    noticed.add(key);
+    if (noticed.size > NOTICED_LIMIT)
+      noticed.delete(noticed.values().next().value!);
+    if (typeof answer.appName === "string")
+      $.ui.toast(
+        `CUA allow-all approved ${displayText(answer.appName)} with no dialog. Run /cua allow-all off to end the mode.`,
+        { timeoutMs: 10000 },
+      );
+  }
+}
 function watchApprovals(
   $: EngineInterface,
   known: string[],
@@ -743,6 +836,7 @@ function watchApprovals(
       } catch {
         /* The next poll retries; the approval timeout bounds the wait. */
       }
+      notice($, (found?.value as { allowed?: unknown } | undefined)?.allowed);
       const list = (found?.value as { approvals?: unknown } | undefined)
         ?.approvals;
       for (const value of Array.isArray(list) ? list : []) {
@@ -813,6 +907,8 @@ export const register: Register = (on) => {
   // Whether the start hook completed. A failed start hook leaves the controls
   // and the launcher connection off, so every call is refused as disabled.
   let ready = false;
+  // Whether a start hook runs now, or none ran yet. A command then waits.
+  let starting = true;
   let connected = false;
   // The session IDs under which a launcher can be registered, most recent
   // first. The array stays the same object, so running watchers see updates.
@@ -833,6 +929,7 @@ export const register: Register = (on) => {
           ? "sdk"
           : undefined;
     ready = false;
+    starting = true;
     connected = false;
     // A fresh load has no held value. A reload keeps the known sessions. A
     // failure to read or write them never disables the interactive controls.
@@ -841,10 +938,11 @@ export const register: Register = (on) => {
     await $.command.register({
       name: "cua",
       description: "CUA controls and launcher status",
-      argumentHint: "[on|off|status|check|grants|stop-service]",
+      argumentHint: "[on|off|status|check|grants|stop-service|allow-all [off]]",
       immediate: true,
     });
     ready = true;
+    starting = false;
     // Desktop attaches after session start, so its session connects at the
     // first command or call instead.
     connected = await reconnect($, start, connected);
@@ -852,6 +950,7 @@ export const register: Register = (on) => {
     return next(event);
   }).catch((_host, event) => {
     ready = false;
+    starting = false;
     connected = false;
     return { cwd: event.cwd };
   });
@@ -872,6 +971,32 @@ export const register: Register = (on) => {
     "command.run",
     { command: ["cua", "cua-integration:cua"] },
     async ($, event) => {
+      // Wait for the start hook, and in an SDK start for the first client.
+      // One limit covers the surface queries and the sleeps: the elapsed
+      // time, and also the number of steps, for a clock that does not wait.
+      const deadline = Date.now() + STARTUP_WAIT_MS;
+      let noClient = false;
+      for (let step = 0; ; step++) {
+        const left = Math.max(deadline - Date.now(), 0);
+        noClient =
+          !starting &&
+          ready &&
+          start === "sdk" &&
+          // A query that does not return in the time that is left counts as
+          // no client, so a stalled query cannot hold the command.
+          (await Promise.race([
+            unattached($),
+            $.clock.sleep(left).then(() => true),
+          ]));
+        if (!(starting || noClient)) break;
+        if (left === 0 || step >= STARTUP_WAIT_MS / STARTUP_POLL_MS) break;
+        await $.clock.sleep(Math.min(STARTUP_POLL_MS, left));
+      }
+      if (starting) return { text: STARTING };
+      // An SDK start with no client can be a Desktop session whose client
+      // attaches later, so the text asks for a second attempt. A session
+      // with a known unsupported surface gets the refusal below.
+      if (noClient) return { text: UNATTACHED };
       if (!ready || !(await controlsAvailable($, start)))
         return {
           text: "CUA controls require the interactive terminal CLI or Claude Code Desktop, with no other client attached to a Desktop session. VS Code, remote, and headless operation are unsupported.",
@@ -893,18 +1018,77 @@ export const register: Register = (on) => {
         return {
           text: `/cua revoke is no longer available, because this integration keeps no lasting grant. A session grant ends when the CUA launcher stops. ${LASTING}`,
         };
+      // `/cua allow-all` turns the mode on, and `/cua allow-all off` turns
+      // it off.
+      const allowAll =
+        action === "allow-all" &&
+        (rest.length === 0 ||
+          (rest.length === 1 && ["on", "off"].includes(rest[0]!)));
       if (
-        !["on", "off", "status", "check", "stop-service"].includes(action) ||
-        rest.length > 0
+        !allowAll &&
+        (!["on", "off", "status", "check", "stop-service"].includes(action) ||
+          rest.length > 0)
       )
-        return {
-          text: "Usage: /cua [on|off|status|check|grants|stop-service]",
-        };
+        return { text: USAGE };
       connected = await reconnect($, start, connected);
       if (!connected)
         return {
           text: "CUA launcher is disconnected. Reconnect the plugin MCP server before use.",
         };
+      // The person turns the allow-all mode on or off. The launcher keeps
+      // the mode in its memory and writes the result to its status.
+      if (allowAll) {
+        // The loader of Claude Code refuses a hooks module that declares the
+        // name `on` again, so this variable has another name (issue #99).
+        const enable = rest[0] !== "off";
+        let found: { value: unknown; session: string };
+        try {
+          found = await lookup($, ["allow-all", enable ? "on" : "off"], known);
+        } catch (error) {
+          return {
+            text: `CUA allow-all did not change: ${(error instanceof Error ? error.message : "launcher control failed").replace(/\.$/, "")}.`,
+          };
+        }
+        const requestId = (found.value as { requestId?: unknown } | null)
+          ?.requestId;
+        if (typeof requestId !== "string")
+          return {
+            text: "CUA allow-all did not change: malformed launcher reply.",
+          };
+        let result: (Snapshot & { finished?: boolean }) | undefined;
+        try {
+          for (
+            let wait = 0;
+            wait < ALLOW_ALL_WAITS && !result?.finished;
+            wait++
+          )
+            result = (
+              await controlRun(
+                $,
+                ["allow-all-wait", requestId],
+                [found.session],
+              )
+            ).value as Snapshot & { finished?: boolean };
+        } catch (error) {
+          return {
+            text: `CUA allow-all ended without a result: ${(error instanceof Error ? error.message : "launcher control failed").replace(/\.$/, "")}. Use /cua status to read the mode.`,
+          };
+        }
+        if (!result?.finished || typeof result.allowAll?.on !== "boolean")
+          return {
+            text: "CUA allow-all: the launcher reported no result in time. Use /cua status to read the mode.",
+          };
+        try {
+          await display($, result);
+        } catch {
+          /* The report below still holds the result. */
+        }
+        if (enable && !result.allowAll.on)
+          return {
+            text: "CUA allow-all did not change: CUA is disabled. Run /cua on, then /cua allow-all.",
+          };
+        return { text: result.allowAll.on ? ALLOW_ALL_ON : ALLOW_ALL_OFF };
+      }
       // The person asks the launcher to stop the Computer Use service. The
       // launcher makes the attempt and writes the result to its status. The
       // command needs no enabled launcher, because it sends no call.
@@ -1108,7 +1292,11 @@ export const register: Register = (on) => {
         context: [...(result.context ?? []), ...approvals.notes],
       };
     try {
-      await display($, await snapshot($, "status", known));
+      const after = await snapshot($, "status", known);
+      // The watch can end between two of its reads. The status after the
+      // call holds each first answer of the mode, also from that time.
+      notice($, after.allowAll?.firsts);
+      await display($, after);
     } catch {
       /* The result still belongs to the native MCP mapper. */
     }

@@ -60,13 +60,16 @@ The plugin starts disabled in each session.
 2. Run `/cua on` when you want to permit computer-use calls.
 3. Ask Claude to do a task in a native app. Answer each approval dialog.
 4. Run `/cua off` when you want to refuse new calls.
-5. Run `/cua stop-service` when the agent pointer of the Computer Use service stays on the screen after a task.
+5. Run `/cua allow-all` when you want no approval dialog for the rest of the session. Read the caution below first.
+6. Run `/cua stop-service` when the agent pointer of the Computer Use service stays on the screen after a task.
 
 Each dialog offers three choices:
 
 - "Allow" answers this request only.
 - "Allow for this session" answers later requests for the same app until the launcher stops.
 - "Deny" refuses the request, and the dependent action does not run.
+
+Caution: `/cua allow-all` approves each app in advance. While the mode is on, Claude can look at and operate each app on your Mac that the Codex app does not refuse, and no dialog asks you first. You do not see the name of an app before Claude uses it. A web page or a message that Claude reads can thus lead Claude to another app, such as your mail or your password manager. Use the mode only for a task whose apps you trust. `/cua allow-all off` or `/cua off` ends the mode, and it also ends when the launcher stops. `/cua status` shows whether the mode is on.
 
 The plugin keeps no permission after the launcher stops. To use an app without a dialog, add the app to the Computer Use always-allow list in the Codex app. `/cua grants` lists the session grants.
 
