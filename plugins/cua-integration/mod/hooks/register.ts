@@ -1,6 +1,15 @@
 import type { EngineInterface, Register } from "claude-code";
 
-import type { Choice, GrantList, Offer, Snapshot } from "../types/index.d.ts";
+import type {
+  Capability,
+  CheckResult,
+  Choice,
+  GrantList,
+  NativePermission,
+  Offer,
+  Snapshot,
+} from "../types/index.d.ts";
+import { displayText } from "./display.ts";
 
 const REF = { plugin: "cua-integration", key: "status" } as const;
 // Host state survives a hot reload of the Mod, while a module variable does
@@ -198,13 +207,192 @@ async function display($: EngineInterface, value: Snapshot) {
     `CUA ${value.enabled ? "on" : "off"} | ${value.pending ? "approval pending" : value.active ? "active" : value.lastCall === "failed" ? "failed" : value.runtimeReady ? "runtime ready" : "not ready"}`,
   );
 }
+// The review state of the runtime packages. An unreviewed package version
+// passed the contract checks of the launcher, and no maintainer reviewed it.
+function review(value: Snapshot): string[] {
+  const state = value.runtimeReview;
+  if (!state || typeof state.mode !== "string") return [];
+  // An unknown mode shows nothing, so a status from another version never
+  // reads as reviewed.
+  if (state.mode === "reviewed") return ["Runtime packages: reviewed."];
+  if (state.mode !== "compatible-unreviewed") return [];
+  const packages = Object.entries(state.unreviewedPackages ?? {})
+    .filter(([, version]) => typeof version === "string")
+    .map(([name, version]) => `${name} ${version}`)
+    .join(", ");
+  return [
+    `Runtime packages: compatible, unreviewed (${packages}). The contract checks passed. No maintainer reviewed these versions.`,
+  ];
+}
+// The result of the native check for one capability. Only the exact state
+// `verified` reads as verified. The strings come from the launcher status, so
+// each one shows through displayText.
+function capabilityText(name: string, value: Capability | undefined): string {
+  if (value?.state === "verified") return `${name} verified`;
+  const failure =
+    typeof value?.failure === "string"
+      ? [`native failure category ${displayText(value.failure)}`]
+      : [];
+  const reason =
+    typeof value?.reason === "string" ? [displayText(value.reason)] : [];
+  const detail = [...failure, ...reason].join(": ");
+  return `${name} unverified${detail ? ` (${detail})` : ""}`;
+}
+const runtimeText = (check: CheckResult): string =>
+  check.runtime && typeof check.runtime.pluginVersion === "string"
+    ? `runtime ${displayText(check.runtime.pluginVersion)} (${Object.entries(
+        check.runtime.packages ?? {},
+      )
+        .filter(([, version]) => typeof version === "string")
+        .map(
+          ([name, version]) => `${displayText(name)} ${displayText(version)}`,
+        )
+        .join(", ")})`
+    : "a runtime that did not start";
+const checkOf = (value: unknown): CheckResult | undefined =>
+  value &&
+  typeof value === "object" &&
+  typeof (value as CheckResult).at === "string"
+    ? (value as CheckResult)
+    : undefined;
+// The native permission lines of the status. A capability is verified only
+// when the last check of this launcher proved it with the current runtime.
+function permissionText(value: Snapshot): string[] {
+  const permission =
+    value.nativePermission && typeof value.nativePermission === "object"
+      ? (value.nativePermission as NativePermission)
+      : undefined;
+  const check = checkOf(permission?.check);
+  const other = checkOf(permission?.otherRuntime);
+  if (check)
+    return [
+      `Native permission: ${capabilityText("accessibility", permission!.accessibility)}; ${capabilityText("screen capture", permission!.screenCapture)}.`,
+      `Checked ${displayText(check.at)} with ${displayText(check.app)} and ${runtimeText(check)}. The result applies to that app and that runtime only.`,
+    ];
+  if (other)
+    return [
+      `Native permission: unverified for the current runtime. Run /cua check.`,
+      `The check of ${displayText(other.at)} ran with another runtime, ${runtimeText(other)}, so its result does not apply: ${capabilityText("accessibility", other.accessibility)}; ${capabilityText("screen capture", other.screenCapture)}.`,
+    ];
+  return [
+    "Native permission: unverified. No check ran in this launcher. Run /cua check.",
+  ];
+}
+// The recovery lines of the status: how many runtime failures the launcher
+// recovered from, and the most recent one. A new runtime starts only at the
+// next call of the caller, so the line says whether it started. The strings
+// come from the launcher status, so each one shows through displayText.
+function recoveryText(value: Snapshot): string[] {
+  const state = value.recovery;
+  const last = Array.isArray(state?.recent) ? state.recent.at(-1) : undefined;
+  if (
+    !state ||
+    !Number.isSafeInteger(state.count) ||
+    !Number.isSafeInteger(state.inRow) ||
+    !Number.isSafeInteger(state.limit) ||
+    !last ||
+    typeof last.at !== "string" ||
+    typeof last.reason !== "string"
+  )
+    return [];
+  return [
+    `Runtime recoveries: ${state.count}, of which ${state.inRow} in a row with no completed call. The launcher stops at a failure after ${state.limit} in a row.`,
+    `Last runtime failure: ${displayText(last.at)}, reason ${displayText(last.reason)}, runtime of ${last.caller === "main" ? "the main loop" : "a subagent"}. ${typeof last.restartedAt === "string" ? `A new runtime started at ${displayText(last.restartedAt)}.` : "No new runtime started yet. It starts at the next call of that caller."}`,
+  ];
+}
+// How many times /cua stop-service asks launcher control to wait for the
+// result. Launcher control waits 10 seconds each time, and one attempt waits
+// at most 3 seconds for the exit of the service.
+const STOP_WAITS = 2;
+// The service line of the status and of /cua stop-service: the last attempt
+// of the launcher to stop the Computer Use service, whose agent pointer
+// stays on the screen while the service lives. The service starts again at
+// the next native request, so the line gives the time of the attempt. The
+// strings come from the launcher status, so each one shows through
+// displayText.
+function serviceText(value: Snapshot): string[] {
+  const stop = value.nativeService;
+  if (!stop || typeof stop.at !== "string" || typeof stop.outcome !== "string")
+    return [];
+  const at = displayText(stop.at);
+  const pids = Array.isArray(stop.pids)
+    ? stop.pids.filter((pid) => Number.isSafeInteger(pid))
+    : [];
+  const processes = pids.length > 0 ? ` (process ${pids.join(", ")})` : "";
+  const cause =
+    stop.trigger === "command"
+      ? " after /cua stop-service"
+      : stop.trigger === "launcher-stop"
+        ? " at the stop of the launcher"
+        : "";
+  const line = (result: string) => [
+    `Computer Use service: at ${at}${cause}, ${result}`,
+  ];
+  switch (stop.outcome) {
+    case "stopped":
+      return line("the launcher stopped it.");
+    case "not-running":
+      return line("no service process ran, so the launcher sent no signal.");
+    case "in-use":
+      return line(
+        "the launcher sent no signal, because a call used the computer or waited for it. Run /cua stop-service again after that call.",
+      );
+    case "still-running":
+      return line(
+        `it still runs after the termination signal of the launcher${processes}${typeof stop.reason === "string" ? `: ${displayText(stop.reason)}` : ""}. Its agent pointer can stay on the screen.`,
+      );
+    case "not-signalled":
+      return line(
+        `no process received a signal of the launcher${processes}${typeof stop.reason === "string" ? `: ${displayText(stop.reason)}` : ""}. Its agent pointer can stay on the screen.`,
+      );
+    default:
+      return [];
+  }
+}
 function text(value: Snapshot, registered: boolean): string {
   return [
     `CUA: ${value.enabled ? "enabled" : "disabled"}.`,
     `Tools registered: ${registered ? "yes" : "no"}. Launcher connected: ${value.connected ? "yes" : "no"}. Runtime ready: ${value.runtimeReady ? "yes" : "no"}.`,
+    ...recoveryText(value),
+    ...review(value),
     `Active calls: ${value.active}. Pending approvals: ${value.pending}. Last call: ${value.lastCall}.`,
-    "Native permission: unverified. Task completion: unverified. A completed call does not prove a completed task.",
+    ...permissionText(value),
+    ...serviceText(value),
+    "Task completion: unverified. A completed call does not prove a completed task.",
     ...(value.error ? [`Error: ${value.error}`] : []),
+  ].join("\n");
+}
+// How many times /cua check asks launcher control to wait for the result.
+// Launcher control waits 20 seconds each time, and the script of the check
+// can run 10 minutes while approvals wait.
+const CHECK_WAITS = 90;
+// The report of /cua check: the result for each capability, how the approval
+// went, and what became of the document.
+function checkText(value: Snapshot, notes: readonly string[]): string {
+  const permission =
+    value.nativePermission && typeof value.nativePermission === "object"
+      ? (value.nativePermission as NativePermission)
+      : undefined;
+  const check = checkOf(permission?.check) ?? checkOf(permission?.otherRuntime);
+  if (!check) return "CUA check: the launcher reported no result.";
+  const approvals = check.approvals ?? { dialogs: 0, sessionGrant: 0 };
+  const passed =
+    check.accessibility?.state === "verified" &&
+    check.screenCapture?.state === "verified";
+  return [
+    `CUA check: ${passed ? "passed" : "not passed"}.`,
+    ...permissionText(value),
+    approvals.dialogs + approvals.sessionGrant === 0
+      ? check.runtime && check.window !== "not-opened"
+        ? "Approval: no request reached the launcher, so no dialog opened. The Codex app allows TextEdit without a request."
+        : "Approval: no request reached the launcher."
+      : `Approval: ${approvals.dialogs} request${approvals.dialogs === 1 ? "" : "s"} opened a dialog, and a session grant answered ${approvals.sessionGrant}.`,
+    check.window === "not-opened"
+      ? "Document: the check opened no document."
+      : check.window === "closed"
+        ? `Document: the check closed its TextEdit window and ${check.fileRemoved ? "deleted its file" : "could not delete its file"}.`
+        : `Document: the check ${check.fileRemoved ? "deleted its file" : "could not delete its file"}. It could not confirm that its TextEdit window "${displayText(check.document ?? "")}" closed. Close that window if it is still open.`,
+    ...notes,
   ].join("\n");
 }
 // Why the session cannot run a call now, or undefined when it can. A start
@@ -250,6 +438,10 @@ async function gate(
 // the call, so the launcher refuses it. Nothing runs.
 const RESTARTED =
   "CUA started a new launcher, because the previous launcher had stopped, for example after an interrupted call. The new launcher starts disabled and refused this call. Run /cua on, then try again.";
+// The note when the Mod finds no launcher after such a call, because the host
+// did not start one. Only the terminal CLI has /mcp reconnect.
+const notRestarted = (start: Start | undefined) =>
+  `CUA found no running launcher after this call. The previous launcher had stopped, for example after an interrupted call. The person can start a launcher with ${start === "terminal" ? "/mcp reconnect or with a new session" : "a new session, because Claude Code Desktop has no /mcp reconnect"}.`;
 // The tokens of the wake calls that /cua has open. A wake call runs the code
 // `undefined` with its token in a comment.
 const wakeTokens = new Set<string>();
@@ -331,66 +523,42 @@ const LABELS: Record<Exclude<Choice, "cancel">, string> = {
   session: "Allow for this session",
   decline: "Deny",
 };
-// The browser keeps a denial of a site request for the session of the
-// runtime, and an approval for the session unless a site policy limits it to
-// the turn. So a site dialog has no one-time choice.
-const SITE_LABELS: typeof LABELS = {
-  ...LABELS,
-  decline: "Deny for this session",
-};
-const KINDS = ["app", "origin", "history", "download", "upload"];
-const HEADERS: Record<Offer["kind"], string> = {
-  app: "App access",
-  origin: "Site access",
-  history: "History access",
-  download: "File download",
-  upload: "File upload",
-};
+// Claude Code cuts a header to 12 characters, so the header is 12 characters
+// or fewer.
+const HEADER = "App access";
 function offerOf(value: unknown): Offer | undefined {
   const offer = value as Offer;
+  // An offer of another form comes from a launcher of another version, for
+  // example a browser offer of an earlier launcher. The Mod cannot show its
+  // facts, so it takes the path of an offer that it does not recognize.
   return offer &&
     typeof offer.operationId === "string" &&
-    KINDS.includes(offer.kind) &&
+    offer.kind === "app" &&
     typeof offer.appId === "string" &&
     typeof offer.appName === "string" &&
     typeof offer.operation === "string" &&
     typeof offer.riskLevel === "string" &&
-    Array.isArray(offer.choices) &&
-    (offer.detail === undefined || typeof offer.detail === "string")
+    Array.isArray(offer.choices)
     ? offer
     : undefined;
 }
-// What a browser request asks for, in the words of its dialog.
-function browserRequestOf(offer: Offer): string {
-  switch (offer.kind) {
-    case "history":
-      return `to read your browsing history (${offer.detail ?? "no details"})`;
-    case "download":
-      return `to download files from ${offer.appId}`;
-    default:
-      return `to upload files to ${offer.appId}. The request does not name the files`;
-  }
+// The strings of an offer come from a request. Each text that a person reads
+// shows them through displayText, so no character from a request changes the
+// direction or the layout of that text.
+function shown(offer: Offer): Offer {
+  return {
+    ...offer,
+    appId: displayText(offer.appId),
+    appName: displayText(offer.appName),
+    operation: displayText(offer.operation),
+    riskLevel: displayText(offer.riskLevel),
+  };
 }
 // The dialog question. It states the lifetime of each offered choice, so a
 // refusal of one request does not read as a lasting denial. It names the
 // Codex app as the place for a lasting permission.
-function questionOf(offer: Offer, choices: readonly Choice[]): string {
-  if (offer.kind === "origin")
-    return [
-      `Browser use in "${offer.appName}" requests access to the site ${offer.appId}. Allow it?`,
-      `The browser keeps a denial until the CUA runtime stops, and usually keeps an approval as long. Set lasting site permissions in the Codex app.`,
-    ].join(" ");
-  if (offer.kind !== "app")
-    return [
-      `Browser use in "${offer.appName}" requests ${browserRequestOf(offer)}. Allow it?`,
-      `"Allow" and "Deny" answer this request only.`,
-      ...(choices.includes("session")
-        ? [
-            `"Allow for this session" lasts until the CUA runtime stops, for this origin.`,
-          ]
-        : []),
-      `Set lasting browser permissions in the Codex app.`,
-    ].join(" ");
+function questionOf(request: Offer, choices: readonly Choice[]): string {
+  const offer = shown(request);
   return [
     `Computer Use requests ${offer.operation} (${offer.riskLevel} risk) on "${offer.appName}" (${offer.appId}). Allow it?`,
     `"Allow" and "Deny" answer this request only.`,
@@ -401,17 +569,17 @@ function questionOf(offer: Offer, choices: readonly Choice[]): string {
   ].join(" ");
 }
 const LASTING =
-  "Lasting app and site permissions belong in the Codex app, for example on its Computer Use always-allow list. This integration keeps no lasting permission and cannot end one.";
+  "Lasting app permissions belong in the Codex app, for example on its Computer Use always-allow list. This integration keeps no lasting permission and cannot end one.";
 function grantText(list: GrantList): string {
   const legacy = list.legacyStore;
   return [
     list.launcherConnected
-      ? `Session grants of this launcher: ${list.session.length === 0 ? "none" : list.session.map((grant) => `${grant.appName} (${grant.resource})`).join(", ")}. Each ends when the CUA launcher stops, for example at a /mcp reconnect or at Claude Code exit.`
+      ? `Session grants of this launcher: ${list.session.length === 0 ? "none" : list.session.map((grant) => `${displayText(grant.appName)} (${displayText(grant.resource)})`).join(", ")}. Each ends when the CUA launcher stops, for example at a /mcp reconnect or at Claude Code exit.`
       : "Session grants: none, because the CUA launcher is disconnected.",
     LASTING,
     ...(legacy
       ? [
-          `An earlier version kept grants in ${legacy.path}. This version does not read that file, so its grants no longer apply${legacy.apps?.length ? `: ${legacy.apps.join(", ")}` : ""}. To use an app without a dialog, add it to the always-allow list in the Codex app. You can then delete the file.`,
+          `An earlier version kept grants in ${displayText(legacy.path)}. This version does not read that file, so its grants no longer apply${legacy.apps?.length ? `: ${legacy.apps.map(displayText).join(", ")}` : ""}. To use an app without a dialog, add it to the always-allow list in the Codex app. You can then delete the file.`,
         ]
       : []),
   ].join("\n");
@@ -422,9 +590,7 @@ function grantText(list: GrantList): string {
 // person answers, `host` for a host program, and absent where nobody can.
 // The check carries the question, the header, and the labels of the dialog
 // in its input, so the Mod gives each check to its own dialog: the first open
-// dialog with the same text that has no check yet. The engine cuts the header
-// to 12 characters (2.1.311 sent "History acce" for "History access"), so a
-// header matches when it starts the header of the dialog. Dialogs with the same text
+// dialog with the same text that has no check yet. Dialogs with the same text
 // take one check each. A check that matches no open dialog, such as one for a
 // question of the model, belongs to no dialog of the Mod.
 type OpenDialog = {
@@ -451,8 +617,7 @@ function attributeCheck(input: unknown, approver: string | undefined) {
   const matches = openDialogs.filter(
     (dialog) =>
       dialog.question === asked.question &&
-      typeof asked.header === "string" &&
-      dialog.header.startsWith(asked.header) &&
+      dialog.header === asked.header &&
       dialog.labels.length === labels.length &&
       dialog.labels.every((label, i) => label === labels[i]),
   );
@@ -482,11 +647,10 @@ async function ask($: EngineInterface, offer: Offer): Promise<Answer> {
   const choices = (["once", "session", "decline"] as const).filter((choice) =>
     offer.choices.includes(choice),
   );
-  const labels = offer.kind === "origin" ? SITE_LABELS : LABELS;
   const dialog: OpenDialog = {
     question: questionOf(offer, choices),
-    header: HEADERS[offer.kind],
-    labels: choices.map((choice) => labels[choice]),
+    header: HEADER,
+    labels: choices.map((choice) => LABELS[choice]),
     approvers: [],
   };
   const { approvers } = dialog;
@@ -497,7 +661,7 @@ async function ask($: EngineInterface, offer: Offer): Promise<Answer> {
       header: dialog.header,
     });
     const choice =
-      choices.find((choice) => labels[choice] === label) ?? "decline";
+      choices.find((choice) => LABELS[choice] === label) ?? "decline";
     const approver = approverOf(approvers);
     if (choice !== "decline" && approver !== "person")
       return {
@@ -593,7 +757,7 @@ function watchApprovals(
         if (!offer && typeof operationId === "string") {
           if (claimed.has(operationId)) continue;
           claimed.add(operationId);
-          const note = `CUA could not show approval request ${operationId}, because the Mod does not recognize its form. The request was cancelled, and no approval dialog is open for it.`;
+          const note = `CUA could not show approval request ${displayText(operationId)}, because the Mod does not recognize its form. The request was cancelled, and no approval dialog is open for it.`;
           notes.push(note);
           $.ui.toast(note, { timeoutMs: 10000 });
           try {
@@ -613,7 +777,7 @@ function watchApprovals(
         if (!answer) break;
         const { choice, reason, approver } = answer;
         if (reason) {
-          const note = `CUA approval for ${offer.appName} was cancelled: ${reason}`;
+          const note = `CUA approval for ${displayText(offer.appName)} was cancelled: ${reason}`;
           notes.push(note);
           $.ui.toast(note, { timeoutMs: 10000 });
         }
@@ -625,7 +789,7 @@ function watchApprovals(
           );
         } catch (error) {
           $.ui.toast(
-            `CUA approval for ${offer.appName} was not applied: ${error instanceof Error ? error.message : "launcher control failed"}`,
+            `CUA approval for ${displayText(offer.appName)} was not applied: ${error instanceof Error ? error.message : "launcher control failed"}`,
           );
         }
       }
@@ -677,7 +841,7 @@ export const register: Register = (on) => {
     await $.command.register({
       name: "cua",
       description: "CUA controls and launcher status",
-      argumentHint: "[on|off|status|grants]",
+      argumentHint: "[on|off|status|check|grants|stop-service]",
       immediate: true,
     });
     ready = true;
@@ -729,15 +893,109 @@ export const register: Register = (on) => {
         return {
           text: `/cua revoke is no longer available, because this integration keeps no lasting grant. A session grant ends when the CUA launcher stops. ${LASTING}`,
         };
-      if (!["on", "off", "status"].includes(action) || rest.length > 0)
+      if (
+        !["on", "off", "status", "check", "stop-service"].includes(action) ||
+        rest.length > 0
+      )
         return {
-          text: "Usage: /cua [on|off|status|grants]",
+          text: "Usage: /cua [on|off|status|check|grants|stop-service]",
         };
       connected = await reconnect($, start, connected);
       if (!connected)
         return {
           text: "CUA launcher is disconnected. Reconnect the plugin MCP server before use.",
         };
+      // The person asks the launcher to stop the Computer Use service. The
+      // launcher makes the attempt and writes the result to its status. The
+      // command needs no enabled launcher, because it sends no call.
+      if (action === "stop-service") {
+        let found: { value: unknown; session: string };
+        try {
+          found = await lookup($, ["stop-service"], known);
+        } catch (error) {
+          return {
+            text: `CUA stop-service did not start: ${(error instanceof Error ? error.message : "launcher control failed").replace(/\.$/, "")}.`,
+          };
+        }
+        const stopId = (found.value as { stopId?: unknown } | null)?.stopId;
+        if (typeof stopId !== "string")
+          return {
+            text: "CUA stop-service did not start: malformed launcher reply.",
+          };
+        let result: (Snapshot & { finished?: boolean }) | undefined;
+        try {
+          // Launcher control waits inside each command.
+          for (let wait = 0; wait < STOP_WAITS && !result?.finished; wait++)
+            result = (
+              await controlRun(
+                $,
+                ["stop-service-wait", stopId],
+                [found.session],
+              )
+            ).value as Snapshot & { finished?: boolean };
+        } catch (error) {
+          return {
+            text: `CUA stop-service ended without a result: ${(error instanceof Error ? error.message : "launcher control failed").replace(/\.$/, "")}. Use /cua status to check the launcher.`,
+          };
+        }
+        const lines = result?.finished ? serviceText(result) : [];
+        if (lines.length === 0)
+          return {
+            text: "CUA stop-service: the launcher reported no result in time. Use /cua status to read the last attempt.",
+          };
+        try {
+          await display($, result!);
+        } catch {
+          /* The report below still holds the result. */
+        }
+        return { text: lines.join("\n") };
+      }
+      // The launcher runs the check as its own operation. The Mod asks for
+      // it, shows each approval request in the dialog, as it does for a call,
+      // and waits for the result. A person must be able to answer the dialog,
+      // so the check needs the same surface as a call.
+      if (action === "check") {
+        const refusal = await surfaceRefusal($, start);
+        if (refusal)
+          return { text: refusal.replaceAll("this call", "this check") };
+        let found: { value: unknown; session: string };
+        try {
+          found = await lookup($, ["check"], known);
+        } catch (error) {
+          return {
+            text: `CUA check did not start: ${(error instanceof Error ? error.message : "launcher control failed").replace(/\.$/, "")}.`,
+          };
+        }
+        const checkId = (found.value as { checkId?: unknown } | null)?.checkId;
+        if (typeof checkId !== "string")
+          return { text: "CUA check did not start: malformed launcher reply." };
+        const approvals = watchApprovals($, known, start);
+        let result: (Snapshot & { finished?: boolean }) | undefined;
+        try {
+          // Launcher control waits inside each command, so this hook spends
+          // none of its own time on the wait.
+          for (let wait = 0; wait < CHECK_WAITS && !result?.finished; wait++)
+            result = (
+              await controlRun($, ["check-wait", checkId], [found.session])
+            ).value as Snapshot & { finished?: boolean };
+        } catch (error) {
+          return {
+            text: `CUA check ended without a result: ${(error instanceof Error ? error.message : "launcher control failed").replace(/\.$/, "")}. Nothing is verified. Use /cua status to check the launcher.`,
+          };
+        } finally {
+          approvals.stop();
+        }
+        if (!result?.finished)
+          return {
+            text: "CUA check did not finish in time. Nothing is verified. Use /cua status to check the launcher.",
+          };
+        try {
+          await display($, result);
+        } catch {
+          /* The report below still holds the result. */
+        }
+        return { text: checkText(result, approvals.notes) };
+      }
       const value = await controlSnapshot($, action, known, mcpServer);
       if (action !== "status")
         await $.store.set("lastEnabledPreference", action === "on");
@@ -787,17 +1045,22 @@ export const register: Register = (on) => {
     // A wake call of /cua never gets a caller record, so a launcher refuses
     // it, also one that started meanwhile.
     if (isWakeCall((event as { code?: unknown }).code)) return next(event);
-    // No launcher runs. The host starts one at this call. The Mod writes no
-    // caller record, so the new launcher refuses the call. See RESTARTED.
+    // No launcher runs. The host can start one at this call. The Mod writes
+    // no caller record, so a new launcher refuses the call. The note names a
+    // new launcher only when launcher control finds one after the call. See
+    // RESTARTED.
     if (state === "missing") {
       const result = await next(event);
+      let found: Snapshot | undefined;
       try {
-        await display($, await snapshot($, "status", known));
+        found = await snapshot($, "status", known);
+        await display($, found);
       } catch {
-        /* The next command shows the new launcher. */
+        /* The next command shows the launcher status. */
       }
+      const note = found ? RESTARTED : notRestarted(start);
       return result && typeof result === "object" && result.deny === undefined
-        ? { ...result, context: [...(result.context ?? []), RESTARTED] }
+        ? { ...result, context: [...(result.context ?? []), note] }
         : result;
     }
     // The launcher reads this record when the call arrives, so the runtime

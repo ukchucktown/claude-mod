@@ -1,5 +1,8 @@
 import { isAbsolute } from "node:path";
-import { validateObservationResult } from "../observations/result.ts";
+import {
+  fitForDelivery,
+  validateObservationResult,
+} from "../observations/result.ts";
 import { ConnectionError, object } from "./protocol.ts";
 
 // Constraint-only schemas from the recorded discovery probe. Descriptions and
@@ -125,3 +128,4 @@ export function validateArguments(
     throw new ConnectionError("state", "Module directory must be absolute");
 }
 export const validateResult = validateObservationResult;
+export const fitResult = fitForDelivery;

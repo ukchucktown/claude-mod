@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { changesLayout } from "../mod/hooks/display.ts";
 import type { NativeApproval } from "./native-approval.ts";
 
 // The Codex app is the only place for a lasting Computer Use permission
@@ -19,13 +20,15 @@ export type SessionGrant = {
 };
 
 // A canonical bundle identifier as the native request supplies it. Grants
-// compare identifiers exactly, so two spellings never share a grant.
+// compare identifiers exactly, so two spellings never share a grant. An
+// identifier holds no character that changes the direction or the layout of
+// text.
 export const resource = (value: unknown): value is string =>
   typeof value === "string" &&
   value.length > 0 &&
   value.length <= 256 &&
   value.trim() === value &&
-  !/[\u0000-\u001f\u007f]/.test(value);
+  !changesLayout(value);
 
 // A high-risk grant covers a low-risk request. A low-risk grant does not
 // cover a request that the native policy now rates high.
@@ -42,7 +45,6 @@ export class SessionGrants {
   reuse(approval: NativeApproval): boolean {
     const grant = this.grants.get(approval.appId);
     return (
-      approval.kind === "app" &&
       grant !== undefined &&
       approval.scopes.includes("session") &&
       covers(grant.riskLevel, approval.riskLevel)

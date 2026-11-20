@@ -1,6 +1,11 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ToolResult } from "../contracts.ts";
 import { ConnectionError, object, nonempty } from "../connection/protocol.ts";
+import { modelImageSize, type PixelSize } from "../native/sky-guard.ts";
 
 // nodeRepl.emitImage accepts PNG, JPEG, and WebP bytes, so a model can emit
 // each of them. Native screenshots in the feasibility runs were PNG.
@@ -12,10 +17,10 @@ export type ImageRecord = Readonly<{
   encoding: "base64";
   bytes: number;
   sha256: string;
-  sourcePixels: { width: number; height: number };
-  clientTransform: "unknown";
-  inputTransform: "unknown";
-  coordinateMapping: "unavailable";
+  sourcePixels: PixelSize;
+  // The size at which the launcher delivers the image. It differs from the
+  // source size only for an image above the limits of `modelImageSize`.
+  modelPixels: PixelSize;
 }>;
 
 function base64(value: unknown, allowEmpty = false): Buffer {
@@ -182,16 +187,15 @@ function image(
   if (!IMAGE_TYPES.includes(mimeType))
     throw new Error(`Unsupported image encoding: ${block.mimeType}`);
   const bytes = base64(block.data);
+  const sourcePixels = DIMENSIONS[mimeType](bytes);
   return {
     contentIndex,
     mimeType,
     encoding: "base64",
     bytes: bytes.length,
     sha256: createHash("sha256").update(bytes).digest("hex"),
-    sourcePixels: DIMENSIONS[mimeType](bytes),
-    clientTransform: "unknown",
-    inputTransform: "unknown",
-    coordinateMapping: "unavailable",
+    sourcePixels,
+    modelPixels: modelImageSize(sourcePixels),
   };
 }
 
@@ -266,10 +270,100 @@ export function inspectImages(result: ToolResult): readonly ImageRecord[] {
   );
 }
 
-// Source pixel dimensions alone never establish model or native input geometry.
-export function requireCoordinateMapping(_record: ImageRecord): never {
-  throw new ConnectionError(
-    "state",
-    "Coordinate input unavailable: client and native input transforms are unverified",
-  );
+// Scales an image to an exact pixel size and returns it as a JPEG image.
+export type Resample = (bytes: Buffer, size: PixelSize) => Promise<Buffer>;
+
+// The macOS image tool does the scaling, because Node has no image decoder.
+// The image is in a directory that only this user can read, for the time of
+// the call.
+export const scaleWithSips: Resample = async (bytes, { width, height }) => {
+  const directory = await mkdtemp(join(tmpdir(), "claude-cua-image-"));
+  try {
+    const source = join(directory, "source");
+    const scaled = join(directory, "scaled.jpg");
+    await writeFile(source, bytes, { mode: 0o600 });
+    await new Promise<void>((done, fail) =>
+      execFile(
+        "/usr/bin/sips",
+        [
+          "--resampleHeightWidth",
+          String(height),
+          String(width),
+          "--setProperty",
+          "format",
+          "jpeg",
+          source,
+          "--out",
+          scaled,
+        ],
+        { timeout: 20_000 },
+        (error) => (error ? fail(error) : done()),
+      ),
+    );
+    return await readFile(scaled);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+};
+
+// Gives each image of a result the size that the model receives without a
+// second resize. The native guard relates a coordinate pair to that size, so
+// the launcher never delivers a larger image: an image that it cannot scale
+// becomes a text block. An image within the limits passes with its bytes
+// unchanged.
+//
+// `delivered` holds the SHA-256 digest of the source bytes of each image that
+// stays an image in the result. The native guard permits a coordinate pair
+// only for a screenshot with one of these digests, so an image that the
+// launcher withheld permits none.
+export async function fitForDelivery(
+  result: ToolResult,
+  resample: Resample = scaleWithSips,
+): Promise<{ result: ToolResult; delivered: string[] }> {
+  const records = inspectImages(result);
+  const delivered: string[] = [];
+  let content: ToolResult["content"] | undefined;
+  for (const { contentIndex, sha256, sourcePixels, modelPixels } of records) {
+    if (
+      sourcePixels.width === modelPixels.width &&
+      sourcePixels.height === modelPixels.height
+    ) {
+      delivered.push(sha256);
+      continue;
+    }
+    content ??= [...result.content];
+    const block = content[contentIndex]!;
+    try {
+      const scaled = await resample(
+        Buffer.from(block.data as string, "base64"),
+        modelPixels,
+      );
+      const next = {
+        ...block,
+        data: scaled.toString("base64"),
+        mimeType: "image/jpeg",
+      };
+      const size = image(next, contentIndex).sourcePixels;
+      if (
+        size.width !== modelPixels.width ||
+        size.height !== modelPixels.height
+      )
+        throw new Error("The scaled image has another size");
+      content[contentIndex] = next;
+      delivered.push(sha256);
+    } catch {
+      content[contentIndex] = {
+        type: "text",
+        text: `The launcher withheld an image of ${sourcePixels.width} by ${sourcePixels.height} pixels, because it could not scale the image to ${modelPixels.width} by ${modelPixels.height} pixels. No coordinate pair refers to this image.`,
+      };
+    }
+  }
+  return { result: content ? { ...result, content } : result, delivered };
+}
+
+export async function fitImages(
+  result: ToolResult,
+  resample: Resample = scaleWithSips,
+): Promise<ToolResult> {
+  return (await fitForDelivery(result, resample)).result;
 }

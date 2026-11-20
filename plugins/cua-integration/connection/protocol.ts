@@ -43,13 +43,20 @@ export class RpcError extends Error {
     this.data = data;
   }
 }
-export type Request = {
-  jsonrpc: "2.0";
-  id: RpcId;
-  method: string;
-  params?: unknown;
-};
-export type Notification = { jsonrpc: "2.0"; method: string; params?: unknown };
+export type Request = { id: RpcId; method: string; params?: unknown };
+export type Notification = { method: string; params?: unknown };
+// How the peer of a stream marks its frames. The stream adds the members to
+// each frame that it sends, and it refuses a received frame that the envelope
+// does not admit.
+export type Envelope = Readonly<{
+  members: Readonly<Record<string, string>>;
+  admits(frame: Record<string, unknown>): boolean;
+}>;
+// An MCP peer sends the JSON-RPC version in each frame.
+export const JSON_RPC_ENVELOPE: Envelope = Object.freeze({
+  members: Object.freeze({ jsonrpc: "2.0" }),
+  admits: (frame: Record<string, unknown>) => frame.jsonrpc === "2.0",
+});
 export const DEFAULT_DEADLINE_MS = 120000;
 export const MAX_DEADLINE_MS = 2147483647;
 // Lets the request owner stop the deadline clock while the peer waits on a
@@ -82,14 +89,17 @@ export class RpcStream {
   onNotification: (notification: Notification) => void = () => {};
   onFailure: (error: Error) => void = () => {};
 
+  private envelope: Envelope;
   constructor(
     input: Readable,
     output: Writable,
     maxFrameBytes = 32 * 1024 * 1024,
+    envelope: Envelope = JSON_RPC_ENVELOPE,
   ) {
     this.input = input;
     this.output = output;
     this.maxFrameBytes = maxFrameBytes;
+    this.envelope = envelope;
     input.on("data", this.data);
     input.on("end", this.ended);
     input.on("close", this.ended);
@@ -144,7 +154,7 @@ export class RpcStream {
     this.fail(new ConnectionError("protocol", message));
   }
   private receive(frame: unknown) {
-    if (!object(frame) || frame.jsonrpc !== "2.0")
+    if (!object(frame) || !this.envelope.admits(frame))
       throw new Error("Invalid JSON-RPC envelope");
     if ("method" in frame) {
       if (
@@ -195,10 +205,11 @@ export class RpcStream {
       );
     else waiter.resolve(frame.result);
   }
-  private send(frame: unknown) {
+  private send(frame: Record<string, unknown>) {
     if (this.fault) throw this.fault;
     try {
-      const line = JSON.stringify(frame) + "\n";
+      const line =
+        JSON.stringify({ ...this.envelope.members, ...frame }) + "\n";
       if (Buffer.byteLength(line) > this.maxFrameBytes)
         throw new ConnectionError(
           "protocol",
@@ -259,7 +270,7 @@ export class RpcStream {
       }
       this.waiting.set(id, waiter);
       try {
-        this.send({ jsonrpc: "2.0", id, method, params });
+        this.send({ id, method, params });
       } catch (error) {
         this.fail(error instanceof Error ? error : new Error(String(error)));
       }
@@ -279,22 +290,17 @@ export class RpcStream {
     this.notify("notifications/cancelled", { requestId: id, reason });
   }
   notify(method: string, params?: unknown) {
-    this.send({
-      jsonrpc: "2.0",
-      method,
-      ...(params === undefined ? {} : { params }),
-    });
+    this.send({ method, ...(params === undefined ? {} : { params }) });
   }
   result(id: RpcId, result: unknown) {
     if (!this.incoming.delete(id))
       throw new ConnectionError("state", "Server request is no longer pending");
-    this.send({ jsonrpc: "2.0", id, result });
+    this.send({ id, result });
   }
   error(id: RpcId, code: number, message: string, data?: unknown) {
     if (!this.incoming.delete(id))
       throw new ConnectionError("state", "Server request is no longer pending");
     this.send({
-      jsonrpc: "2.0",
       id,
       error: { code, message, ...(data === undefined ? {} : { data }) },
     });

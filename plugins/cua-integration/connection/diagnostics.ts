@@ -1,16 +1,27 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, realpathSync, statSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ToolResult } from "../contracts.ts";
 import {
+  codexVersion,
   COMPATIBILITY,
-  discoverRuntime,
+  RUNTIME,
+  signedByOpenAI,
   type ConfigurationProblem,
+  type DiscoveryOptions,
   type LaunchSpec,
+  type RuntimeReview,
 } from "./launch.ts";
+import { checkResults } from "./control.ts";
+import {
+  nativePermission,
+  sameRuntime,
+  type CheckResult,
+  type NativePermission,
+  type RuntimeVersion,
+} from "./native-check.ts";
 import { ConnectionError, object } from "./protocol.ts";
 
 // The categories name the cause of a failure, not its severity. A missing
@@ -20,13 +31,13 @@ export type FailureCategory =
   | ConfigurationProblem
   | "failed-policy"
   | "failed-execution";
-// The native and browser guards start each refusal with one of these prefixes.
-// The runtime can put an error name before the message.
-const GUARD_REFUSAL = /\b(?:Computer Use|Browser use) refused: /;
+// The native guard starts each refusal with this prefix. The runtime can put
+// an error name before the message.
+const GUARD_REFUSAL = /\bComputer Use refused: /;
 
 // The category of an error that stopped an initialization or a call. During
-// initialization, a protocol error means that the runtime's handshake or tool
-// catalog differs from the reviewed contract.
+// initialization, a protocol error means that the handshake of the Codex host
+// or the tool catalog of the runtime differs from the reviewed contract.
 export function failureCategory(
   error: unknown,
   phase: "initialize" | "call" = "call",
@@ -66,15 +77,6 @@ export function sanitize(text: string, home = homedir()): string {
 // versions than the report knows. The unknown fields name what it lacks. It
 // is historical evidence, not an exact match.
 export type PartialLiveRecord = { record: string; unknown: string[] };
-export type ProfileReport = {
-  surfaces: string[];
-  outcome: "ready" | ConfigurationProblem;
-  reason?: string;
-  // The live records that observed this exact combination of versions.
-  liveRecords: string[];
-  partialLiveRecords: PartialLiveRecord[];
-  automaticCodexApprovals?: readonly string[];
-};
 export type PrerequisiteReport = {
   evidence: "local-prerequisites";
   claim: string;
@@ -89,42 +91,48 @@ export type PrerequisiteReport = {
     runtimePlugin?: string;
     config?: string;
     configSha256?: string;
+    toolOverridesSha256?: string;
+    // The source of the `js` tool description, and the runtime surfaces
+    // that it describes.
+    toolInstructions?: LaunchSpec["diagnostics"]["toolInstructions"];
     packages?: Record<string, string>;
-    surfaces: string[];
+    // The Codex CLI that hosts the runtime. Its version is in `packages`.
+    codexCli?: string;
+    // Why discovery selected this runtime plugin version.
+    selection?: LaunchSpec["diagnostics"]["selection"];
   };
-  // The live records that observed the selected profile with these versions.
+  // The review state of the selected runtime packages and of the Codex CLI.
+  // The mode `compatible-unreviewed` names each version that no maintainer
+  // reviewed and that passed the contract checks.
+  runtimeReview?: RuntimeReview;
+  // The live records that observed the launcher with these versions.
   // An empty list means that no live check covers this combination exactly.
   liveRecords: string[];
   // The live records that agree with each version that they pin, but lack
   // some versions of the report.
   partialLiveRecords: PartialLiveRecord[];
   node: { outcome: "ready" | "unsupported-version"; reason?: string };
-  // Each installed runtime configuration, checked with the selected surfaces.
-  // The check never selects one by its folder name.
+  // Each installed runtime configuration.
+  // A folder name alone never makes a candidate ready.
   candidates: Array<{
     pluginVersion: string;
     outcome: "ready" | ConfigurationProblem;
     reason?: string;
+    review?: RuntimeReview["mode"];
   }>;
-  profiles: ProfileReport[];
-  nativePermission: "unverified";
+  // The native permission of the selected runtime, from the most recent
+  // `/cua check` result that a connected launcher holds for the same runtime
+  // version. Without such a result, each capability is unverified.
+  nativePermission: NativePermission;
   taskSuccess: "unverified";
 };
 const CLAIM =
   "Local availability only. A ready outcome is not live acceptance, native permission, or task success. Only a live record with the same versions shows acceptance.";
-const surfaceList = (value: string) => [
-  ...new Set(
-    value
-      .split(",")
-      .map((surface) => surface.trim())
-      .filter(Boolean),
-  ),
-];
 function attempt(
-  options: Parameters<typeof discoverRuntime>[0],
+  options: DiscoveryOptions,
 ): LaunchSpec | { problem: ConfigurationProblem; reason: string } {
   try {
-    return discoverRuntime(options);
+    return RUNTIME.discover(options);
   } catch (error) {
     const category = failureCategory(error);
     return {
@@ -145,11 +153,9 @@ function liveRecords(
   diagnostics: LaunchSpec["diagnostics"],
   clientVersion: string | undefined,
 ): { exact: string[]; partial: PartialLiveRecord[] } {
-  const surfaces = [...diagnostics.surfaces].sort().join(",");
   const exact: string[] = [];
   const partial: PartialLiveRecord[] = [];
   for (const record of COMPATIBILITY.liveRecords) {
-    if ([...record.surfaces].sort().join(",") !== surfaces) continue;
     const pairs: Array<[string, string | undefined, string | undefined]> = [
       ["client", record.clientVersion, clientVersion],
       ["runtimePlugin", record.runtimePluginVersion, diagnostics.pluginVersion],
@@ -203,24 +209,48 @@ export function claudeVersion(
     : { failure: "claude --version printed no version" };
 }
 // Checks the configuration that the launcher would select, with the same
-// discovery code, and reports what each surface profile needs. The report
+// discovery code. The report
 // contains versions, digests, and paths under "~", and no environment value,
 // session identity, or credential.
 export function diagnose(
   options: {
     pluginRoot?: string;
     version?: string;
-    surfaces?: string;
+    pins?: string;
+    appManifest?: string;
+    signedByOpenAI?: (path: string) => boolean;
+    codexVersion?: (path: string) => string | undefined;
     clientVersion?: string;
     // Why the Claude Code CLI is unavailable, when the check found that.
     clientFailure?: string;
     nodeVersion?: string;
     baseEnvironment?: NodeJS.ProcessEnv;
+    // The results of the native checks that the connected launchers hold.
+    checkResults?: () => CheckResult[];
   } = {},
 ): PrerequisiteReport {
-  const surfaces = surfaceList(options.surfaces ?? "computer");
+  const signatures = new Map<string, boolean>();
+  const cliVersions = new Map<string, string | undefined>();
   const base = {
     ...(options.pluginRoot ? { pluginRoot: options.pluginRoot } : {}),
+    ...(options.pins ? { pins: options.pins } : {}),
+    ...(options.appManifest ? { appManifest: options.appManifest } : {}),
+    // One report makes several discovery attempts, and each attempt checks
+    // the same files. The report asks for each signature one time.
+    signedByOpenAI: (path: string) => {
+      let result = signatures.get(path);
+      if (result === undefined) {
+        result = (options.signedByOpenAI ?? signedByOpenAI)(path);
+        signatures.set(path, result);
+      }
+      return result;
+    },
+    // The same applies to the version of the Codex CLI.
+    codexVersion: (path: string) => {
+      if (!cliVersions.has(path))
+        cliVersions.set(path, (options.codexVersion ?? codexVersion)(path));
+      return cliVersions.get(path);
+    },
     ...(options.baseEnvironment
       ? { baseEnvironment: options.baseEnvironment }
       : {}),
@@ -238,62 +268,22 @@ export function diagnose(
   const selected = attempt({
     ...base,
     ...(options.version ? { version: options.version } : {}),
-    surfaces: surfaces.join(","),
   });
-  const root =
-    options.pluginRoot ??
-    join(homedir(), ".codex/plugins/cache/openai-bundled/unified-computer-use");
   let installed: string[] = [];
   try {
-    installed = readdirSync(root).filter((entry) => {
-      try {
-        return statSync(join(root, entry, ".mcp.json")).isFile();
-      } catch {
-        return false;
-      }
-    });
+    installed = RUNTIME.installedVersions(options.pluginRoot);
   } catch {
     /* The selected attempt reports the missing cache. */
   }
-  const candidates = installed.sort().map((pluginVersion) => {
-    const result = attempt({
-      ...base,
-      version: pluginVersion,
-      surfaces: surfaces.join(","),
-    });
+  const candidates = installed.map((pluginVersion) => {
+    const result = attempt({ ...base, version: pluginVersion });
     return "problem" in result
       ? { pluginVersion, outcome: result.problem, reason: result.reason }
-      : { pluginVersion, outcome: "ready" as const };
-  });
-  // The computer profile and the browser profile can fail separately, for
-  // example when only the browser package changed.
-  const profiles = ["computer", "computer,browser"].map((value) => {
-    const result = attempt({
-      ...base,
-      ...(options.version ? { version: options.version } : {}),
-      surfaces: value,
-    });
-    if ("problem" in result)
-      return {
-        surfaces: surfaceList(value),
-        outcome: result.problem,
-        reason: result.reason,
-        liveRecords: [],
-        partialLiveRecords: [],
-      };
-    const matched = liveRecords(result.diagnostics, options.clientVersion);
-    return {
-      surfaces: surfaceList(value),
-      outcome: "ready" as const,
-      liveRecords: matched.exact,
-      partialLiveRecords: matched.partial,
-      ...(result.diagnostics.browserProfile
-        ? {
-            automaticCodexApprovals:
-              result.diagnostics.browserProfile.automaticCodexApprovals,
-          }
-        : {}),
-    };
+      : {
+          pluginVersion,
+          outcome: "ready" as const,
+          review: result.diagnostics.review.mode,
+        };
   });
   let components: PrerequisiteReport["components"] = {
     adapter: COMPATIBILITY.adapterVersion,
@@ -301,22 +291,30 @@ export function diagnose(
     client:
       options.clientVersion ??
       (options.clientFailure !== undefined ? "unavailable" : "unknown"),
-    surfaces,
   };
   let fingerprint: string | undefined;
   let records: string[] = [];
   let partialRecords: PartialLiveRecord[] = [];
+  let runtimeReview: RuntimeReview | undefined;
+  let runtimeVersion: RuntimeVersion | undefined;
   if (!("problem" in selected)) {
     const d = selected.diagnostics;
+    runtimeVersion = { pluginVersion: d.pluginVersion, packages: d.packages };
     components = {
       ...components,
       ...(d.appVersion ? { app: d.appVersion } : {}),
       runtimePlugin: d.pluginVersion,
       config: sanitize(d.configPath),
       configSha256: d.configSha256,
+      ...(d.toolOverridesSha256
+        ? { toolOverridesSha256: d.toolOverridesSha256 }
+        : {}),
+      ...(d.toolInstructions ? { toolInstructions: d.toolInstructions } : {}),
       packages: d.packages,
-      surfaces: [...d.surfaces],
+      codexCli: sanitize(d.codexCli),
+      selection: d.selection,
     };
+    runtimeReview = d.review;
     // The digest covers the versions and the configuration digest, not the
     // paths, so two machines with the same profile share a fingerprint.
     fingerprint = createHash("sha256")
@@ -329,7 +327,6 @@ export function diagnose(
           components.runtimePlugin,
           components.configSha256,
           Object.entries(d.packages).sort(),
-          components.surfaces,
         ]),
       )
       .digest("hex")
@@ -349,6 +346,17 @@ export function diagnose(
               reason: options.clientFailure,
             }
           : undefined;
+  // A result of the selected runtime version comes first. Otherwise the most
+  // recent result shows as a result of another runtime, never as current.
+  let results: CheckResult[] = [];
+  try {
+    results = (options.checkResults ?? checkResults)();
+  } catch {
+    /* Without a readable result, each capability stays unverified. */
+  }
+  const lastCheck =
+    results.find((result) => sameRuntime(result.runtime, runtimeVersion)) ??
+    results[0];
   return {
     evidence: "local-prerequisites",
     claim: CLAIM,
@@ -356,39 +364,42 @@ export function diagnose(
     ...(failed?.reason ? { reason: failed.reason } : {}),
     ...(fingerprint ? { fingerprint } : {}),
     components,
+    ...(runtimeReview ? { runtimeReview } : {}),
     liveRecords: records,
     partialLiveRecords: partialRecords,
     node,
     candidates,
-    profiles,
-    nativePermission: "unverified",
+    nativePermission: nativePermission(lastCheck, runtimeVersion),
     taskSuccess: "unverified",
   };
 }
 
-// node diagnostics.ts [--plugin-version VERSION] [--surfaces SURFACES]
-// [--client-version VERSION]. The defaults follow the launcher environment.
+// node diagnostics.ts [--plugin-version VERSION]
+// [--runtime-pins contracts|strict] [--client-version VERSION]. The defaults
+// follow the launcher environment.
 // The exit code is 0 for a ready outcome and 1 otherwise.
 function run(argv: string[]): PrerequisiteReport {
   const flags: Record<string, string> = {};
   for (let i = 0; i < argv.length; i += 2) {
     const [flag, value] = [argv[i]!, argv[i + 1]];
     if (
-      !["--plugin-version", "--surfaces", "--client-version"].includes(flag) ||
+      !["--plugin-version", "--runtime-pins", "--client-version"].includes(
+        flag,
+      ) ||
       value === undefined
     )
       throw new Error(
-        "Usage: diagnostics.ts [--plugin-version VERSION] [--surfaces computer|computer,browser] [--client-version VERSION]",
+        "Usage: diagnostics.ts [--plugin-version VERSION] [--runtime-pins contracts|strict] [--client-version VERSION]",
       );
     flags[flag] = value;
   }
   const version = flags["--plugin-version"] ?? process.env.CUA_PLUGIN_VERSION;
-  const surfaces = flags["--surfaces"] ?? process.env.CUA_SURFACES;
+  const pins = flags["--runtime-pins"] ?? process.env.CUA_RUNTIME_PINS;
   const flag = flags["--client-version"];
   const client = flag ? { version: flag } : claudeVersion();
   return diagnose({
     ...(version ? { version } : {}),
-    ...(surfaces ? { surfaces } : {}),
+    ...(pins ? { pins } : {}),
     ...("version" in client
       ? { clientVersion: client.version }
       : { clientFailure: client.failure }),

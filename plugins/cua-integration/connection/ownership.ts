@@ -34,6 +34,9 @@ const RECORD_LOCK_WAIT_MS = 1000;
 // its connection. The guard refuses each native request without them.
 export const OWNERSHIP_ENV = "CLAUDE_CUA_OWNERSHIP";
 export const CONNECTION_ENV = "CLAUDE_CUA_CONNECTION";
+// The environment variable that tells the native guard the delivery record
+// of its connection.
+export const DELIVERY_ENV = "CLAUDE_CUA_DELIVERY";
 
 // The runtime that holds the lease, and the call that it acts for. The
 // processes decide when the lease is stale: while the launcher, its runtime,
@@ -94,6 +97,12 @@ export function ownershipRoot() {
 export function ownershipPath(resource: string, root = ownershipRoot()) {
   const key = createHash("sha256").update(resource).digest("hex");
   return join(root, `resource.${key}.json`);
+}
+
+// The delivery record of one runtime connection, next to the lease file.
+export function deliveryPath(connection: string, root = ownershipRoot()) {
+  const key = createHash("sha256").update(connection).digest("hex");
+  return join(root, `delivery.${key}.json`);
 }
 
 const text = (value: unknown): value is string =>
@@ -385,6 +394,16 @@ export class ResourceOwnership {
       first === undefined ||
       first.waiterId === waiterId ||
       !live(first.launcherPid)
+    );
+  }
+  // Runs the action under the record lock when no runtime holds the lease
+  // and none waits for it. A waiter joins the queue under the same lock, so
+  // the lease stays free while the action runs. Returns undefined, and does
+  // not run the action, when a runtime holds the lease or waits for it. The
+  // action must be short, because each other change of the record waits.
+  whenFree<T>(action: () => T): T | undefined {
+    return this.change((record) =>
+      record.holder || record.queue.length > 0 ? undefined : action(),
     );
   }
   // Frees the lease when this holder still has it. A release cannot fail the

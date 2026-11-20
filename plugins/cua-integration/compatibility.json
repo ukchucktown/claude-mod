@@ -1,5 +1,5 @@
 {
-  "adapterVersion": "0.2.4",
+  "adapterVersion": "0.3.0",
   "nodeBaseline": "24.21.0",
   "nodeMajors": {
     "minimum": 24,
@@ -30,54 +30,38 @@
       "clientVersion": "2.1.312",
       "sha256": "b17c6407f4800426db052491483c4bf0aabc36ce686526fe9b70cd904a821f5a",
       "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.312 writes beside a plugin that it loads. Against 2.1.311, it changes only its version line and the comment on the effort level of a session. The Mod uses neither."
+    },
+    {
+      "clientVersion": "2.1.328",
+      "sha256": "0c9a5e993863f6f7da473bc84fd8749d85b1a51fbb554bc4c750860528ccf0fc",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.328 writes beside a plugin that it loads. The Mod type-checks against it. No copy of the 2.1.312 set was available, so no comparison of the two texts exists."
+    },
+    {
+      "clientVersion": "2.1.329",
+      "sha256": "aec7b446af0d3b0ebb883d4139909fec66465dafe33ddd559111d7fc913b1803",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.329 writes beside a plugin that it loads. The Mod type-checks against it. Against 2.1.328, it adds the `agent.report` hook and theme types, adds the value `unanswered` to the refusal of a prompt fill, and changes comments. The Mod uses none of these."
     }
   ],
   "runtimePackages": {
-    "computer": {
-      "@oai/cua-repl": "0.1.2",
-      "@oai/cua": "0.2.6",
-      "@oai/sky": "0.7.13"
-    },
-    "browser": {
-      "@oai/browser-desktop": "0.1.1"
-    }
+    "@oai/cua-repl": "0.1.5",
+    "@oai/cua": "0.2.7",
+    "@oai/sky": "0.7.21"
   },
+  "codexCli": ["0.169.0-alpha.11.1", "0.169.1"],
   "liveRecords": [
     {
       "record": "docs/implementation/cli-acceptance.json",
       "result": "pass",
       "host": "Interactive Claude Code CLI on local macOS",
-      "clientVersion": "2.1.311",
-      "runtimePluginVersion": "26.1021.31345",
+      "clientVersion": "2.1.329",
+      "runtimePluginVersion": "26.1111.71704",
       "packages": {
-        "@oai/cua-repl": "0.1.2",
-        "@oai/cua": "0.2.6",
-        "@oai/sky": "0.7.13"
+        "@oai/cua-repl": "0.1.5",
+        "@oai/cua": "0.2.7",
+        "@oai/sky": "0.7.21",
+        "codex-cli": "0.169.1"
       },
-      "surfaces": ["computer"],
-      "appVersion": "26.1021.31345"
-    },
-    {
-      "record": "docs/implementation/browser.md#interactive-check-in-claude-code",
-      "result": "pass",
-      "host": "Interactive Claude Code CLI on local macOS",
-      "clientVersion": "2.1.310",
-      "runtimePluginVersion": "26.1021.31345",
-      "surfaces": ["computer", "browser"]
-    },
-    {
-      "record": "docs/implementation/desktop-acceptance.json",
-      "result": "accepted with documented differences",
-      "host": "Claude Code Desktop 3.6556.2 on local macOS",
-      "clientVersion": "2.1.308",
-      "runtimePluginVersion": "26.1021.31345",
-      "packages": {
-        "@oai/cua-repl": "0.1.2",
-        "@oai/cua": "0.2.6",
-        "@oai/sky": "0.7.13"
-      },
-      "surfaces": ["computer"],
-      "appVersion": "26.1021.31345"
+      "appVersion": "26.1111.71704"
     }
   ],
   "feasibilityOnly": {

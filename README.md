@@ -6,17 +6,16 @@ A Claude Code marketplace for the mods of ukchucktown. The marketplace has one p
 
 `cua-integration` lets Claude Code operate native macOS apps through the Computer Use runtime of the ChatGPT app. Claude observes an app through its accessibility tree and screenshots, and it acts on an element by its index in that tree. Each app operation asks for your approval in a Claude Code dialog, unless the Codex app already permits the app.
 
-The plugin supports two host profiles on a local Mac:
+This release supports one host profile on a local Mac: the interactive terminal Claude Code CLI, with no remote client attached.
 
-- The interactive terminal Claude Code CLI, with no remote client attached
-- Claude Code Desktop, with no other client attached
+The plugin also runs in Claude Code Desktop, with no other client attached, but this release makes no support claim for Desktop. The release acceptance did not run in Desktop after the plugin changed how it starts the Computer Use runtime. A later release restores the claim after a Desktop check.
 
-In both profiles, a person must answer each approval dialog. The plugin refuses each call in a headless run, in an Agent SDK host, in the VS Code extension panel, in a cloud session, and while a remote client, such as Remote Control, is attached. The [host support page](docs/host-support.md) lists each surface and the versions that the release was tested with.
+In the CLI and in Desktop, a person must answer each approval dialog. The plugin refuses each call in a headless run, in an Agent SDK host, in the VS Code extension panel, in a cloud session, and while a remote client, such as Remote Control, is attached. The [host support page](docs/host-support.md) lists each surface and the versions that the release was tested with.
 
 The plugin does not support these capabilities:
 
-- Coordinate input and drag. Claude can operate only the elements that an app exposes in its accessibility tree.
-- The browser surface of the ChatGPT app. The plugin includes it, off by default, and it has no live acceptance in Claude Code.
+- Coordinate input and drag. Claude can click, scroll, and drag at a point of a screenshot, but this release makes no support claim for that input: its check used one app on one display.
+- Control of a browser through the Chrome extension of the ChatGPT app. For this plugin, a browser is a native app: Claude operates it through the accessibility tree and the screenshots of its window, as it operates each other app. The release was tested with Google Chrome only. An approval of a browser lets Claude read the title of each tab of the observed window.
 - More than one caller that controls apps at the same time.
 
 ## Requirements
@@ -61,6 +60,7 @@ The plugin starts disabled in each session.
 2. Run `/cua on` when you want to permit computer-use calls.
 3. Ask Claude to do a task in a native app. Answer each approval dialog.
 4. Run `/cua off` when you want to refuse new calls.
+5. Run `/cua stop-service` when the agent pointer of the Computer Use service stays on the screen after a task.
 
 Each dialog offers three choices:
 
@@ -104,6 +104,7 @@ claude plugin marketplace remove claude-mod
 
 - A turn end reports cleanup success as unverified, because the runtime suppresses the failures of its own handlers.
 - The native service of the ChatGPT app can keep an app grant after the launcher stops. The plugin does not revoke it.
+- The agent pointer of the Computer Use service can stay on the screen after a turn. Run `/cua stop-service` to stop the service and remove the pointer. The plugin also stops the service when a session that used computer use ends. A Computer Use task of the Codex app that runs at that time loses its service, so do not use computer use in the Codex app and in Claude Code at the same time.
 - In Claude Code Desktop, Esc on an approval dialog ends the turn. The dialog approves nothing.
 
 ## Source

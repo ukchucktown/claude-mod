@@ -2,6 +2,7 @@ import type {
   DialogAnswer,
   LauncherControl,
   LifecycleRequest,
+  Recovery,
 } from "./control.ts";
 import type { Readable, Writable } from "node:stream";
 import { choiceDecision } from "../policy/native-approval.ts";
@@ -15,8 +16,24 @@ import {
   rpcId,
   type Request,
 } from "./protocol.ts";
+import type { ServiceStop } from "./service.ts";
 import { PROTOCOL_VERSION, RuntimeSupervisor } from "./supervisor.ts";
 import { failureCategory, resultCategory } from "./diagnostics.ts";
+import {
+  CHECK_APP,
+  CHECK_TIMEOUT_MS,
+  checkScript,
+  documentEnvironment,
+  evaluate,
+  failed,
+  nativePermission,
+  documentName,
+  newMarker,
+  type CheckDocument,
+  type CheckEnvironment,
+  type CheckResult,
+  type RuntimeVersion,
+} from "./native-check.ts";
 
 // How many lifecycle outcomes the launcher status keeps.
 export const LIFECYCLE_HISTORY = 10;
@@ -25,6 +42,22 @@ export const ABANDON_GRACE_MS = 3000;
 // How many runtimes one launcher keeps: the main loop and its subagents. Each
 // caller has its own runtime, so no caller sees the bindings of another.
 export const RUNTIME_LIMIT = 4;
+// A **recovery**: after a runtime failure, the launcher stays connected, and
+// the next call of that caller starts a new runtime. The launcher makes at
+// most this many recoveries in a row. A call that returns a result ends the
+// row, because it shows that a runtime works. A failure after the last
+// recovery of a row stops the launcher, so a runtime that fails at each start
+// does not start without end.
+export const RECOVERY_LIMIT = 3;
+// How long a call waits until each process of the failed runtime of its
+// caller is gone. The value is the wait for a lease.
+export const RECOVERY_WAIT_MS = 30000;
+// The note of the first result after a recovery.
+export const RECOVERED =
+  "The Computer Use runtime of this caller failed, and this call ran in a new runtime. The JavaScript bindings of the earlier runtime are gone. A call that ran at the failure ended with its failure and an unknown effect, and the launcher did not repeat it. Observe each app again before further input to that app.";
+// The note of the next result after a call that the client abandoned.
+const ABANDONED =
+  "The client cancelled an earlier call while it waited for app access. Steps of that script before the request may have run. Observe the current app state before further input.";
 // The runtime key of the main loop. A subagent's key is its agent ID.
 const MAIN = "";
 
@@ -35,7 +68,121 @@ type Runtime = {
   active: number;
   usedAt: number;
   starting: Promise<void>;
+  // The start of the runtime that replaces this runtime after its failure.
+  replacement?: Promise<Runtime>;
 };
+// The reason category of a runtime failure: the kind of its error.
+function recoveryReason(error: Error): Recovery["reason"] {
+  if (error instanceof RpcError) return "protocol";
+  return error instanceof ConnectionError &&
+    (error.kind === "timeout" ||
+      error.kind === "transport" ||
+      error.kind === "protocol")
+    ? error.kind
+    : "state";
+}
+// The recovery information of one launcher. It has two parts, and no other
+// code holds either of them.
+// - The counts and the recent recoveries of the launcher, which last as long
+//   as the launcher.
+// - The **pending information** of each caller: the notes that the next
+//   result of that caller starts with, and the recovery of that caller for
+//   which no new runtime started yet. It does not belong to a runtime, so it
+//   stays when the launcher closes the runtime of that caller. A result that
+//   a working runtime returns to the caller takes the notes, and the start of
+//   a runtime of the caller completes the recovery. The end of the
+//   conversation and the stop of the launcher drop the rest.
+// The ledger holds the pending information of at most `callerLimit` callers.
+// One more caller removes the information of the caller that got its first
+// item earliest.
+function recoveryLedger(callerLimit: number) {
+  const totals = { count: 0, inRow: 0, recent: [] as Recovery[] };
+  const pending = new Map<
+    string,
+    { notes: Set<string>; recovery?: Recovery }
+  >();
+  const entry = (key: string) => {
+    let held = pending.get(key);
+    if (!held) {
+      held = { notes: new Set() };
+      pending.set(key, held);
+      for (const oldest of pending.keys()) {
+        if (pending.size <= callerLimit) break;
+        if (oldest !== key) pending.delete(oldest);
+      }
+    }
+    return held;
+  };
+  return {
+    // A runtime of this caller failed, or its start failed. Returns false
+    // when the row is at its limit: this failure is then no recovery, and the
+    // launcher stops.
+    failed(key: string, error: Error): boolean {
+      if (totals.inRow >= RECOVERY_LIMIT) return false;
+      const recovery: Recovery = {
+        at: new Date().toISOString(),
+        reason: recoveryReason(error),
+        caller: key === MAIN ? "main" : "subagent",
+      };
+      totals.count++;
+      totals.inRow++;
+      totals.recent.push(recovery);
+      if (totals.recent.length > LIFECYCLE_HISTORY) totals.recent.shift();
+      const held = entry(key);
+      held.recovery = recovery;
+      held.notes.add(RECOVERED);
+      return true;
+    },
+    // Adds a note to the next result of this caller.
+    note(key: string, text: string) {
+      entry(key).notes.add(text);
+    },
+    // A runtime of this caller started.
+    started(key: string) {
+      const held = pending.get(key);
+      if (!held?.recovery) return;
+      held.recovery.restartedAt = new Date().toISOString();
+      delete held.recovery;
+      if (held.notes.size === 0) pending.delete(key);
+    },
+    // A working runtime returned a result, which ends the row of recoveries.
+    worked() {
+      totals.inRow = 0;
+    },
+    // Takes the notes of this caller for a result that reaches the client.
+    take(key: string): string[] {
+      const held = pending.get(key);
+      if (!held) return [];
+      const notes = [...held.notes];
+      held.notes.clear();
+      if (!held.recovery) pending.delete(key);
+      return notes;
+    },
+    // The conversation ended. Its notes are of no use to the next
+    // conversation, and its subagents do not return. The main loop continues,
+    // so a recovery of it still waits for its new runtime.
+    conversationEnded() {
+      for (const [key, held] of pending) {
+        held.notes.clear();
+        if (key !== MAIN || !held.recovery) pending.delete(key);
+      }
+    },
+    // The launcher stopped.
+    clear() {
+      pending.clear();
+    },
+    status() {
+      return totals.count === 0
+        ? undefined
+        : {
+            count: totals.count,
+            inRow: totals.inRow,
+            limit: RECOVERY_LIMIT,
+            recent: totals.recent.map((item) => ({ ...item })),
+          };
+    },
+  };
+}
 
 // Stdio is the only client boundary. No HTTP routes or unauthenticated bridge.
 export function serve(
@@ -52,7 +199,8 @@ export function serve(
       | "answers"
       | "caller"
       | "lifecycle"
-    >;
+    > &
+      Partial<Pick<LauncherControl, "checkRequest" | "serviceStopRequest">>;
     // How often the launcher checks for the Mod's answer while an approval waits.
     answerPollMs?: number;
     // How often the launcher checks for lifecycle events that the Mod relays.
@@ -62,12 +210,22 @@ export function serve(
     abandonGraceMs?: number;
     // How many caller runtimes the launcher keeps at one time.
     runtimeLimit?: number;
+    // How long a call waits for the exit of the failed runtime of its caller.
+    recoveryWaitMs?: number;
     // Creates the runtime of one caller. The main loop's runtime starts at
     // initialize; a subagent's runtime starts at its first call.
     createSupervisor(
       onPending: (pending: PendingRequest) => void,
       caller: { agentId?: string },
     ): RuntimeSupervisor;
+    // The document of the native check, and the version of a runtime. The
+    // defaults are a temporary TextEdit document and the launch diagnostics
+    // of the runtime.
+    checkEnvironment?: CheckEnvironment;
+    runtimeVersion?: (owner: RuntimeSupervisor) => RuntimeVersion | undefined;
+    // Makes one attempt to stop the Computer Use service, and resolves to
+    // the result, or to undefined when the launcher knows no service bundle.
+    stopService?: () => Promise<ServiceStop | undefined>;
     // Called once when the server stops, so the process can exit.
     onStopped?: () => void;
   },
@@ -84,16 +242,60 @@ export function serve(
     | "stopped" = "new";
   // Client requests that have not received a response yet.
   let activeCalls = 0;
+  // The version of a runtime: its plugin and its packages.
+  const versionOf =
+    options.runtimeVersion ??
+    ((owner: RuntimeSupervisor): RuntimeVersion | undefined => {
+      const launch = owner.health().launch;
+      return launch
+        ? { pluginVersion: launch.pluginVersion, packages: launch.packages }
+        : undefined;
+    });
+  // The native check that runs now, with its runtime, and the result of the
+  // last check that finished. The result lives in this process only, so it
+  // ends with the launcher.
+  let checking: { id: string; owner?: RuntimeSupervisor } | undefined;
+  let checkResult: CheckResult | undefined;
+  // The recoveries of this launcher and the notes that wait for each caller.
+  const ledger = recoveryLedger(options.runtimeLimit ?? RUNTIME_LIMIT);
+  // A failed runtime stays the runtime of its caller until the next call of
+  // that caller replaces it. Thus, the status shows the failure until then.
+  const hasFailed = (runtime: Runtime) =>
+    runtime.owner.health().state === "failed";
   const publish = () => {
+    const recovery = ledger.status();
     const health = main()?.health();
-    const owners = [...runtimes.values()].map((runtime) => runtime.owner);
+    const owners = [
+      ...[...runtimes.values()]
+        .filter((runtime) => !hasFailed(runtime))
+        .map((runtime) => runtime.owner),
+      ...(checking?.owner ? [checking.owner] : []),
+    ];
     const grants = main()?.grantStatus();
+    const current = main() ? versionOf(main()!) : undefined;
     options.control?.publish({
+      ...(current ? { runtimeVersion: current } : {}),
+      ...(checking
+        ? { nativeCheck: { id: checking.id, state: "running" as const } }
+        : checkResult
+          ? { nativeCheck: { id: checkResult.id, state: "finished" as const } }
+          : {}),
+      // A result of another runtime version never shows as current.
+      nativePermission: nativePermission(checkResult, current),
       runtimeReady: health?.state === "ready",
       ...(health ? { runtimeGeneration: health.runtimeGeneration } : {}),
+      ...(health?.launch
+        ? {
+            runtimeReview: {
+              mode: health.launch.review.mode,
+              unreviewedPackages: health.launch.review.unreviewedPackages,
+            },
+          }
+        : {}),
       active: activeCalls,
       pending: owners.reduce((sum, owner) => sum + owner.pending().length, 0),
       runtimes: owners.length,
+      ...(recovery ? { recovery } : {}),
       ...(grants
         ? {
             ...grants,
@@ -142,11 +344,83 @@ export function serve(
   // The number of conversation transitions. A call admitted under one count
   // cannot run under a later one, also when it waited for its runtime.
   let transitions = 0;
-  // A note for the next result after a call that the client abandoned.
-  let recovery: string | undefined;
   // Runtimes that closed and whose processes can still run. Launcher control
   // keeps the session until each of them has exited.
   const closing: Array<Promise<void>> = [];
+  // The launcher stops the Computer Use service at two events (decision
+  // record 0006), because the agent pointer of the service stays on the
+  // screen while the service lives. The launcher never stops the service at
+  // a turn end: the person decides when the service stops during a session.
+  // - The command `/cua stop-service` of a person. The attempt needs no call
+  //   of this launcher, because the person can want to stop a service that
+  //   another product started. While a call of this launcher runs, the
+  //   result is `in-use`, and no signal goes out.
+  // - The stop of the launcher, after each of its runtime processes exited,
+  //   and only when a call of the launcher used the service since the
+  //   service last stopped at an attempt. A launcher with no such call
+  //   never stops the service on its own.
+  // The result goes to the status. A service that stays, or an attempt that
+  // fails, changes no call and no teardown.
+  // A use of the service is a call that reached dispatch in a runtime, also
+  // a call of the native check. A call that the gate, the runtime limit, or
+  // the lease refused sent no request to the service, so it is no use. The
+  // launcher counts the uses. An attempt that stops the service covers only
+  // the uses from before its start: a call that starts while the attempt
+  // waits for the exit can start a new service, and its use stays.
+  let serviceUses = 0;
+  let usesCovered = 0;
+  const serviceUse = () => {
+    serviceUses++;
+  };
+  let serviceStops: Promise<void> = Promise.resolve();
+  const attemptStop = (
+    trigger: NonNullable<ServiceStop["trigger"]>,
+    request?: string,
+  ): Promise<void> => {
+    serviceStops = serviceStops.then(async () => {
+      if (
+        trigger === "launcher-stop" &&
+        (!options.stopService || serviceUses === usesCovered)
+      )
+        return;
+      const observed = serviceUses;
+      let result: ServiceStop | undefined;
+      try {
+        // The check of the calls and the start of the attempt are in one
+        // synchronous step, so no call starts between them.
+        result =
+          trigger === "command" && activeCalls > 0
+            ? { at: new Date().toISOString(), outcome: "in-use" }
+            : await options.stopService?.();
+        result ??= {
+          at: new Date().toISOString(),
+          outcome: "not-signalled",
+          reason: "the launcher knows no service bundle",
+        };
+      } catch (error) {
+        result = {
+          at: new Date().toISOString(),
+          outcome: "not-signalled",
+          reason: error instanceof Error ? error.message : String(error),
+        };
+      }
+      // Each other result leaves the uses, so the launcher stop tries again.
+      if (result.outcome === "stopped" || result.outcome === "not-running")
+        usesCovered = observed;
+      try {
+        options.control?.publish({
+          nativeService: {
+            ...result,
+            trigger,
+            ...(request === undefined ? {} : { request }),
+          },
+        });
+      } catch {
+        /* The attempt is over. The status fails closed. */
+      }
+    });
+    return serviceStops;
+  };
   // A stopped server closes its output, so the client sees a disconnect
   // instead of a server that silently stops answering. Launcher control keeps
   // the session until every runtime process has exited, so another launcher
@@ -158,21 +432,29 @@ export function serve(
     clearInterval(poll);
     clearInterval(lifecyclePoll);
     offered.clear();
+    ledger.clear();
     for (const runtime of runtimes.values()) {
       runtime.owner.close();
       closing.push(runtime.owner.exited());
     }
     runtimes.clear();
+    if (checking?.owner) {
+      checking.owner.close();
+      closing.push(checking.owner.exited());
+    }
     client.close();
-    void Promise.all(closing).finally(() => {
-      try {
-        options.control?.close();
-      } catch {
-        /* A telemetry failure cannot prevent transport teardown. */
-      } finally {
-        options.onStopped?.();
-      }
-    });
+    void Promise.all(closing)
+      .catch(() => {})
+      .then(() => attemptStop("launcher-stop"))
+      .finally(() => {
+        try {
+          options.control?.close();
+        } catch {
+          /* A telemetry failure cannot prevent transport teardown. */
+        } finally {
+          options.onStopped?.();
+        }
+      });
   };
   // Closes the runtime of one subagent. The main loop's runtime closes only
   // with the server. A closed runtime keeps its lease until its process exits.
@@ -280,6 +562,7 @@ export function serve(
       (runtime) => runtime.key !== MAIN,
     );
     for (const runtime of subagents) retire(runtime);
+    ledger.conversationEnded();
     return owner
       .lifecycle({
         type: "session.end",
@@ -323,6 +606,20 @@ export function serve(
   };
   const lifecyclePoll = setInterval(() => {
     if (phase !== "ready" || !main() || !options.control) return;
+    let checkId: string | undefined;
+    try {
+      checkId = options.control.checkRequest?.();
+    } catch {
+      /* The Mod reports a check that did not start. */
+    }
+    if (checkId !== undefined) void nativeCheck(checkId);
+    let stopId: string | undefined;
+    try {
+      stopId = options.control.serviceStopRequest?.();
+    } catch {
+      /* The Mod reports a request without a result. */
+    }
+    if (stopId !== undefined) void attemptStop("command", stopId);
     let requests: LifecycleRequest[] = [];
     try {
       requests = options.control.lifecycle();
@@ -356,63 +653,220 @@ export function serve(
       throw error;
     }
   };
-  // Creates and wires the runtime of one caller. A runtime that fails after
-  // its start stops the server, as an uncertain runtime state requires.
+  // A runtime of a caller failed. The failure belongs to that one runtime, so
+  // the launcher stays connected: this is a recovery. The failed runtime
+  // retired its generation and keeps its lease until its processes are gone.
+  // The enabled state and the session grants belong to the launcher, so they
+  // stay. A failure of the main runtime during initialization returns as the
+  // initialize error instead. A start that fails is the same failure, also
+  // when the factory fails before a supervisor exists.
+  const recover = (key: string, error: Error) => {
+    if (phase !== "initialized" && phase !== "ready") return;
+    // The stop waits one turn of the event loop, so an in-flight call first
+    // receives its error response.
+    if (!ledger.failed(key, error)) setImmediate(stop);
+    else tryPublish();
+  };
+  // Creates and wires the runtime of one caller, and makes it the runtime of
+  // that caller.
   const createRuntime = (key: string): Runtime => {
     let owner: RuntimeSupervisor | undefined;
-    owner = options.createSupervisor(
-      (pending) => onPending(pending, owner!),
-      key === MAIN ? {} : { agentId: key },
-    );
+    try {
+      owner = options.createSupervisor(
+        (pending) => onPending(pending, owner!),
+        key === MAIN ? {} : { agentId: key },
+      );
+    } catch (error) {
+      // No supervisor exists that can report this failure. The runtime of
+      // the caller stays as it was, so the next call tries again.
+      recover(key, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
     owner.onPendingClosed = (operationId) => {
       if (offered.delete(operationId)) offer();
     };
     owner.onGrantReused = tryPublish;
-    const created = owner;
+    owner.onDispatch = serviceUse;
     const runtime: Runtime = {
       key,
       owner,
       active: 0,
       usedAt: Date.now(),
-      starting: owner.start().then(() => {
-        // A runtime failure after initialization stops the server, so the
-        // client sees a disconnect. The stop waits one turn of the event
-        // loop, so an in-flight call first receives its error response.
-        created.onFailed = () => {
-          if (phase === "initialized" || phase === "ready") setImmediate(stop);
-        };
-      }),
+      starting: owner.start(),
     };
+    owner.onFailed = (error) => recover(key, error);
     runtimes.set(key, runtime);
     return runtime;
   };
-  // The runtime of a caller, started at its first call. At the limit, the
-  // least recently used subagent runtime without a running call closes.
+  // Starts the runtime that replaces a failed runtime of the same caller. The
+  // new runtime starts only after each process of the failed runtime is gone,
+  // so it takes the lease only after that. It has another generation and no
+  // binding of the failed runtime.
+  const replace = async (old: Runtime): Promise<Runtime> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const gone = await Promise.race([
+      old.owner.exited().then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(
+          () => resolve(false),
+          options.recoveryWaitMs ?? RECOVERY_WAIT_MS,
+        );
+      }),
+    ]);
+    clearTimeout(timer);
+    if (!gone)
+      throw new RpcError(
+        -32000,
+        "A process of the failed runtime of this caller still runs, so no new runtime started; this call did not run",
+      );
+    if (phase === "stopped")
+      throw new RpcError(-32000, "Connection is not ready");
+    // The failed runtime closed during the wait, for example at a transition.
+    if (runtimes.get(old.key) !== old) return runtimeFor(old.key);
+    const next = createRuntime(old.key);
+    await next.starting;
+    ledger.started(old.key);
+    return next;
+  };
+  // Makes room for one more runtime. The runtime of a native check counts as
+  // one runtime. At the limit, the least recently used subagent runtime
+  // without a running call closes. Otherwise the new work fails.
+  const admit = (work: "call" | "check") => {
+    const count = runtimes.size + (checking?.owner ? 1 : 0);
+    if (count < (options.runtimeLimit ?? RUNTIME_LIMIT)) return;
+    const idle = [...runtimes.values()]
+      .filter((other) => other.key !== MAIN && other.active === 0)
+      .sort((a, b) => a.usedAt - b.usedAt)[0];
+    if (!idle)
+      throw new RpcError(
+        -32000,
+        `${count} CUA callers already run calls in their own runtimes; this ${work} did not run`,
+      );
+    retire(idle);
+    report(
+      `Subagent runtime closed to admit another caller; a later turn end of that subagent is skipped`,
+    );
+  };
+  // The native check of /cua check. The launcher is the caller: no client
+  // call exists, so no caller record exists, and the check never uses the
+  // runtime of a caller. It runs one fixed script in a runtime of its own,
+  // which no model code reaches, and that runtime closes at the end. The
+  // check obeys each rule of a call: the /cua on gate, the lease of the
+  // controlled resource, the approval boundary, and one use of its
+  // identifier. It adds no automatic accept, and it never runs twice.
+  const nativeCheck = async (id: string) => {
+    if (checking || phase !== "ready") return;
+    checking = { id };
+    activeCalls++;
+    tryPublish();
+    const toolUseId = `cua-check:${id}`;
+    const marker = newMarker();
+    const name = documentName();
+    let document: CheckDocument | undefined;
+    let dialogs = 0;
+    let owner: RuntimeSupervisor | undefined;
+    let runtime: RuntimeVersion | undefined;
+    let verdict: Pick<CheckResult, "accessibility" | "screenCapture"> & {
+      closed: boolean;
+    };
+    try {
+      options.control?.assertEnabled();
+      admit("check");
+      const created = options.createSupervisor((pending) => {
+        onPending(pending, created);
+        dialogs++;
+      }, {});
+      owner = created;
+      checking.owner = created;
+      created.onPendingClosed = (operationId) => {
+        if (offered.delete(operationId)) offer();
+      };
+      created.onGrantReused = tryPublish;
+      created.onDispatch = serviceUse;
+      await created.start();
+      runtime = versionOf(created);
+      if (!runtime) throw new Error("The runtime reported no version");
+      tryPublish();
+      const result = await created.call(
+        {
+          sessionId: options.sessionId,
+          turnId: toolUseId,
+          toolUseId,
+          runtimeGeneration: created.health().runtimeGeneration,
+        },
+        "js",
+        // The script names the document by its file name. The marker is in
+        // the document only.
+        { code: checkScript(name), timeout_ms: CHECK_TIMEOUT_MS },
+        // The document opens only while this runtime holds the lease.
+        async () => {
+          document = await (
+            options.checkEnvironment ?? documentEnvironment()
+          ).open(name, marker);
+        },
+      );
+      verdict = evaluate(result, marker, declined.has(toolUseId));
+    } catch (error) {
+      const capability = failed(error);
+      verdict = {
+        accessibility: capability,
+        screenCapture: capability,
+        closed: false,
+      };
+    }
+    declined.delete(toolUseId);
+    // The file goes at each end of the check. A window that did not close
+    // can stay, and the result says so.
+    let fileRemoved = true;
+    try {
+      fileRemoved = document?.remove() ?? true;
+    } catch {
+      fileRemoved = false;
+    }
+    const sessionGrant = owner?.grantStatus().reusedGrants ?? 0;
+    if (owner) {
+      owner.close();
+      closing.push(owner.exited());
+    }
+    checkResult = {
+      id,
+      app: CHECK_APP,
+      at: new Date().toISOString(),
+      ...(runtime ? { runtime } : {}),
+      accessibility: verdict.accessibility,
+      screenCapture: verdict.screenCapture,
+      approvals: { dialogs, sessionGrant },
+      ...(document ? { document: name } : {}),
+      window: !document
+        ? "not-opened"
+        : verdict.closed
+          ? "closed"
+          : "left-open",
+      fileRemoved,
+    };
+    checking = undefined;
+    activeCalls--;
+    tryPublish();
+  };
+  // The runtime of a caller. It starts at the first call of the caller, and
+  // another one starts at the first call after a failure. Calls that arrive
+  // during a start wait for that one start.
   const runtimeFor = async (key: string): Promise<Runtime> => {
     let runtime = runtimes.get(key);
+    if (runtime && hasFailed(runtime)) {
+      const old = runtime;
+      old.replacement ??= replace(old).finally(() => {
+        // A start that did not happen leaves the next call to try again.
+        if (runtimes.get(key) === old) delete old.replacement;
+        tryPublish();
+      });
+      return old.replacement;
+    }
     if (!runtime) {
-      if (runtimes.size >= (options.runtimeLimit ?? RUNTIME_LIMIT)) {
-        const idle = [...runtimes.values()]
-          .filter((other) => other.key !== MAIN && other.active === 0)
-          .sort((a, b) => a.usedAt - b.usedAt)[0];
-        if (!idle)
-          throw new RpcError(
-            -32000,
-            `${runtimes.size} CUA callers already run calls in their own runtimes; this call did not run`,
-          );
-        retire(idle);
-        report(
-          `Subagent runtime closed to admit another caller; a later turn end of that subagent is skipped`,
-        );
-      }
+      admit("call");
       runtime = createRuntime(key);
-      try {
-        await runtime.starting;
-      } catch (error) {
-        if (runtimes.get(key) === runtime) runtimes.delete(key);
-        runtime.owner.close();
-        throw error;
-      }
+      await runtime.starting;
+      ledger.started(key);
       tryPublish();
     }
     await runtime.starting;
@@ -456,7 +910,7 @@ export function serve(
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: { name: "claude-cua-owner", version: "0.1.0" },
-          instructions: runtime.owner.serverInfo()?.instructions,
+          instructions: runtime.owner.instructions(),
         };
       } catch (error) {
         // A failure during initialization returns as the initialize error.
@@ -587,12 +1041,23 @@ export function serve(
             params.name,
             args as Record<string, Json>,
           );
-          if (recovery !== undefined && !abandoned.has(request.id)) {
-            result = {
-              ...result,
-              content: [{ type: "text", text: recovery }, ...result.content],
-            };
-            recovery = undefined;
+          // A result of a runtime that works ends a row of recoveries, and
+          // it starts with the notes of its caller. An error result of
+          // `js_reset` fails its runtime. Such a result changes neither, so
+          // the note and the row wait for the runtime that replaces it.
+          if (!hasFailed(runtime)) {
+            ledger.worked();
+            const notes = abandoned.has(request.id)
+              ? []
+              : ledger.take(runtime.key);
+            if (notes.length > 0)
+              result = {
+                ...result,
+                content: [
+                  ...notes.map((text) => ({ type: "text", text })),
+                  ...result.content,
+                ],
+              };
           }
           try {
             options.control?.publish({
@@ -634,14 +1099,13 @@ export function serve(
     inFlight.set(request.id, {});
     void dispatch(request)
       .finally(() => {
-        const toolUseId = inFlight.get(request.id)?.toolUseId;
+        const { toolUseId, runtime } = inFlight.get(request.id) ?? {};
         inFlight.delete(request.id);
         clearTimeout(graceTimers.get(request.id));
         graceTimers.delete(request.id);
         if (toolUseId !== undefined) abandonedCalls.delete(toolUseId);
-        if (abandoned.has(request.id))
-          recovery =
-            "The client cancelled an earlier call while it waited for app access. Steps of that script before the request may have run. Observe the current app state before further input.";
+        if (abandoned.has(request.id) && runtime && phase !== "stopped")
+          ledger.note(runtime.key, ABANDONED);
       })
       .then((result) => {
         if (!abandoned.delete(request.id) && !cancelled.delete(request.id))

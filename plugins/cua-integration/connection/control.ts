@@ -29,19 +29,57 @@ import {
   write,
 } from "../private-files.ts";
 import type { FailureCategory } from "./diagnostics.ts";
+import {
+  UNVERIFIED,
+  type CheckResult,
+  type NativePermission,
+  type RuntimeVersion,
+} from "./native-check.ts";
 import { ConnectionError } from "./protocol.ts";
+import type { ServiceStop } from "./service.ts";
 
+// One recovery: a runtime of one caller failed, and the launcher stayed
+// connected.
+export type Recovery = {
+  // When the runtime failed.
+  at: string;
+  // The reason category of the failure: an expired deadline, a lost
+  // connection to the Codex host or a host that exited, a response outside
+  // the protocol, or a runtime in an unknown state, such as after a failed
+  // reset. The names give causes, not an order of severity.
+  reason: "timeout" | "transport" | "protocol" | "state";
+  caller: "main" | "subagent";
+  // When the runtime that replaces the failed one started. That runtime
+  // starts at the next call of the caller, so the time is absent until then.
+  restartedAt?: string;
+};
 export type ControlStatus = {
   instanceId: string;
   pid: number;
   connected: boolean;
   runtimeReady: boolean;
   runtimeGeneration?: string;
+  // The review state of the runtime packages of the main runtime. In the
+  // mode `compatible-unreviewed`, no maintainer reviewed the named package
+  // versions, and each contract check passed.
+  runtimeReview?: {
+    mode: "reviewed" | "compatible-unreviewed";
+    unreviewedPackages: Record<string, string>;
+  };
   active: number;
   pending: number;
   // How many caller runtimes the launcher keeps: the main loop's and one for
   // each subagent that called recently.
   runtimes?: number;
+  // The recoveries of this launcher: how many it made, how many of them in a
+  // row with no completed call between them, the limit for that row, and the
+  // most recent recoveries, oldest first. Absent before the first recovery.
+  recovery?: {
+    count: number;
+    inRow: number;
+    limit: number;
+    recent: Recovery[];
+  };
   lastCall: "none" | "active" | "completed" | "failed";
   error?: string;
   // The diagnostic category of the last failure. The error names the cause.
@@ -58,13 +96,22 @@ export type ControlStatus = {
   // its dialog as the engine reported it to the Mod. This is evidence for a
   // record. No reader takes a decision from it.
   dialogAnswers?: DialogAnswer[];
-  nativePermission: "unverified";
+  // The last attempt of this launcher to stop the Computer Use service, with
+  // its result and its trigger. Absent before the first attempt. The entry
+  // stays in the status of a stopped launcher.
+  nativeService?: ServiceStop;
+  // The version of the main runtime: the runtime plugin and its packages.
+  runtimeVersion?: RuntimeVersion;
+  // The native check that runs now, or the last one that finished. The Mod
+  // waits for the check that it requested by this identifier.
+  nativeCheck?: { id: string; state: "running" | "finished" };
+  // The native permission of the current runtime, from the last check of
+  // this launcher. Each capability stays unverified until a check proves it.
+  nativePermission: NativePermission;
   taskSuccess: "unverified";
 };
-function paths(
-  session: string,
-  root = join(tmpdir(), `claude-cua-${process.getuid?.()}`),
-) {
+const defaultRoot = () => join(tmpdir(), `claude-cua-${process.getuid?.()}`);
+function paths(session: string, root = defaultRoot()) {
   if (!session.trim()) throw new Error("A session identity is required");
   privateDirectory(root);
   const key = createHash("sha256").update(session).digest("hex");
@@ -85,6 +132,10 @@ function paths(
       return join(root, `${key}.call.${digest}.json`);
     },
     lifecycle: join(root, `${key}.lifecycle.`),
+    // The request of the Mod for one native check.
+    check: join(root, `${key}.check.json`),
+    // The request of the Mod for one stop of the Computer Use service.
+    serviceStop: join(root, `${key}.service-stop.json`),
     // The next lifecycle sequence number for this session.
     sequence: join(root, `${key}.sequence.json`),
   };
@@ -169,7 +220,7 @@ export class LauncherControl {
       active: 0,
       pending: 0,
       lastCall: "none",
-      nativePermission: "unverified",
+      nativePermission: UNVERIFIED,
       taskSuccess: "unverified",
     };
     locked(this.files.status, () => {
@@ -319,6 +370,44 @@ export class LauncherControl {
       .sort((a, b) => a.sequence - b.sequence)
       .map(({ request }) => request);
   }
+  // Takes the request of the Mod for a native check, and resolves to its
+  // identifier. The file is removed once read, so a request starts at most
+  // one check. A request that another launcher instance received, or one
+  // with an unexpected shape, reads as absent.
+  checkRequest(): string | undefined {
+    if (!existsSync(this.files.check)) return undefined;
+    let record: any;
+    try {
+      record = read(this.files.check);
+    } catch {
+      record = undefined;
+    }
+    rmSync(this.files.check, { force: true });
+    return record?.instanceId === this.status.instanceId &&
+      typeof record.id === "string" &&
+      OPERATION_ID.test(record.id)
+      ? record.id
+      : undefined;
+  }
+  // Takes the request of the Mod for a stop of the Computer Use service, and
+  // resolves to its identifier. The file is removed once read, so a request
+  // starts at most one attempt. A request that another launcher instance
+  // received, or one with an unexpected shape, reads as absent.
+  serviceStopRequest(): string | undefined {
+    if (!existsSync(this.files.serviceStop)) return undefined;
+    let record: any;
+    try {
+      record = read(this.files.serviceStop);
+    } catch {
+      record = undefined;
+    }
+    rmSync(this.files.serviceStop, { force: true });
+    return record?.instanceId === this.status.instanceId &&
+      typeof record.id === "string" &&
+      OPERATION_ID.test(record.id)
+      ? record.id
+      : undefined;
+  }
   close() {
     if (this.closed) return;
     try {
@@ -337,15 +426,24 @@ export class LauncherControl {
     } catch {
       /* Leftover records name this instance and cannot act for another. */
     }
+    for (const request of [this.files.check, this.files.serviceStop])
+      try {
+        rmSync(request, { force: true });
+      } catch {
+        /* A leftover request names this instance, and no other reads it. */
+      }
     try {
-      // The session grants end with this launcher, so the status of a
-      // stopped launcher lists none.
+      // The session grants and the result of the native check end with this
+      // launcher, so the status of a stopped launcher holds neither.
+      const { nativeCheck: _ended, ...status } = this.status;
+      this.status = status;
       this.publish({
         connected: false,
         runtimeReady: false,
         active: 0,
         pending: 0,
         sessionGrants: [],
+        nativePermission: UNVERIFIED,
       });
     } finally {
       this.closed = true;
@@ -391,6 +489,12 @@ function connectedStatus(files: ReturnType<typeof paths>) {
     throw new Error("The CUA launcher is disconnected");
   return status;
 }
+// The last status that the launcher of a session wrote, also after that
+// launcher stopped. A stopped launcher keeps there the result of its last
+// attempt to stop the Computer Use service. This function changes no file.
+export function lastStatus(session: string, root?: string): ControlStatus {
+  return statusAt(paths(session, root).status);
+}
 export function control(session: string, action: string, root?: string) {
   const files = paths(session, root);
   const status = connectedStatus(files);
@@ -402,6 +506,134 @@ export function control(session: string, action: string, root?: string) {
       enabled: action === "on",
     });
   return { ...status, enabled: enabledAt(files.decision, status.instanceId) };
+}
+// Asks the connected launcher for one native check and resolves to the
+// identifier of that check. The launcher runs the check as its own operation,
+// so no caller record belongs to it. A disabled launcher refuses, as it
+// refuses a call, and one launcher runs one check at a time.
+export function check(session: string, root?: string): { checkId: string } {
+  const files = paths(session, root);
+  const status = connectedStatus(files);
+  if (!enabledAt(files.decision, status.instanceId))
+    throw new Error("CUA is disabled. Run /cua on, then /cua check");
+  if (status.nativeCheck?.state === "running")
+    throw new Error("A native check already runs in this launcher");
+  const checkId = randomUUID();
+  // A request of a launcher that stopped names another instance.
+  try {
+    if (read(files.check)?.instanceId !== status.instanceId)
+      rmSync(files.check, { force: true });
+  } catch {
+    rmSync(files.check, { force: true });
+  }
+  try {
+    create(files.check, { instanceId: status.instanceId, id: checkId });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST")
+      throw new Error("A native check already waits for this launcher");
+    throw error;
+  }
+  return { checkId };
+}
+// Asks the connected launcher to stop the Computer Use service, and resolves
+// to the identifier of that request. The launcher makes the attempt as its
+// own operation and writes the result to its status. The request needs no
+// enabled launcher, because it sends no call, and a person can want to remove
+// an agent pointer while CUA is off.
+export function serviceStop(
+  session: string,
+  root?: string,
+): { stopId: string } {
+  const files = paths(session, root);
+  const status = connectedStatus(files);
+  const stopId = randomUUID();
+  // A request of a launcher that stopped names another instance.
+  try {
+    if (read(files.serviceStop)?.instanceId !== status.instanceId)
+      rmSync(files.serviceStop, { force: true });
+  } catch {
+    rmSync(files.serviceStop, { force: true });
+  }
+  try {
+    create(files.serviceStop, { instanceId: status.instanceId, id: stopId });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST")
+      throw new Error(
+        "A stop of the Computer Use service already waits for this launcher",
+      );
+    throw error;
+  }
+  return { stopId };
+}
+// How long one `stop-service-wait` command waits for the result. An attempt
+// waits at most 3 seconds for the exit of the service.
+export const SERVICE_STOP_WAIT_MS = 10000;
+// Waits until the launcher wrote the result of the request `stopId`, at most
+// `waitMs`, and resolves to the status then. `finished` is false when the
+// wait ended first. A launcher that stops ends the wait with an error.
+export function serviceStopWait(
+  session: string,
+  stopId: string,
+  root?: string,
+  waitMs = SERVICE_STOP_WAIT_MS,
+) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const status = control(session, "status", root);
+    const finished = status.nativeService?.request === stopId;
+    if (finished || Date.now() >= deadline) return { ...status, finished };
+    Atomics.wait(pause, 0, 0, CHECK_WAIT_POLL_MS);
+  }
+}
+// The results of the native checks that the connected launchers of this user
+// hold, most recent first. The prerequisite check reads them, because it runs
+// outside a session. A launcher that stopped holds no result, and an unsafe
+// or malformed status file reads as absent.
+export function checkResults(root = defaultRoot()): CheckResult[] {
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return [];
+  }
+  const results: CheckResult[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".status.json")) continue;
+    try {
+      const status = statusAt(join(root, name));
+      if (!status.connected || !live(status.pid)) continue;
+      const permission = status.nativePermission;
+      const result = permission?.check ?? permission?.otherRuntime;
+      if (result && typeof result.at === "string") results.push(result);
+    } catch {
+      /* Not a status of a running launcher. */
+    }
+  }
+  return results.sort((a, b) => b.at.localeCompare(a.at));
+}
+// How long one `check-wait` command waits, and how often it reads the status.
+// The Mod repeats the command, because the host bounds one command.
+export const CHECK_WAIT_MS = 20000;
+const CHECK_WAIT_POLL_MS = 100;
+const pause = new Int32Array(new SharedArrayBuffer(4));
+// Waits until the launcher finished the check `checkId`, at most `waitMs`,
+// and resolves to the status then. `finished` is false when the wait ended
+// first. A launcher that stops ends the wait with an error.
+export function checkWait(
+  session: string,
+  checkId: string,
+  root?: string,
+  waitMs = CHECK_WAIT_MS,
+) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const status = control(session, "status", root);
+    const finished =
+      status.nativeCheck?.id === checkId &&
+      status.nativeCheck.state === "finished";
+    if (finished || Date.now() >= deadline) return { ...status, finished };
+    Atomics.wait(pause, 0, 0, CHECK_WAIT_POLL_MS);
+  }
 }
 // The approvals that the connected launcher waits on. A list that another
 // launcher instance wrote is not this launcher's, so it reads as empty.
@@ -581,6 +813,18 @@ function run(argv: string[]): unknown {
       reason: rest[0]!,
       conversation: rest[1]!,
     });
+  if (session !== undefined && action === "check" && rest.length === 0)
+    return check(session);
+  if (session !== undefined && action === "check-wait" && rest.length === 1)
+    return checkWait(session, rest[0]!);
+  if (session !== undefined && action === "stop-service" && rest.length === 0)
+    return serviceStop(session);
+  if (
+    session !== undefined &&
+    action === "stop-service-wait" &&
+    rest.length === 1
+  )
+    return serviceStopWait(session, rest[0]!);
   if (session !== undefined && action === "approvals" && rest.length === 0)
     return { approvals: approvals(session) };
   if (session !== undefined && action === "grants" && rest.length === 0)
@@ -594,7 +838,7 @@ function run(argv: string[]): unknown {
   if (session !== undefined && action !== undefined && rest.length === 0)
     return control(session, action);
   throw new Error(
-    "Usage: control.ts SESSION status|on|off|approvals|grants, control.ts SESSION answer OPERATION_ID CHOICE [person|host|none], control.ts SESSION call TOOL_USE_ID TURN_ID CONVERSATION [AGENT_ID], control.ts SESSION turn-end TURN_ID answer|aborted [AGENT_ID], or control.ts SESSION session-end clear|resume CONVERSATION",
+    "Usage: control.ts SESSION status|on|off|approvals|grants|check|stop-service, control.ts SESSION check-wait CHECK_ID, control.ts SESSION stop-service-wait STOP_ID, control.ts SESSION answer OPERATION_ID CHOICE [person|host|none], control.ts SESSION call TOOL_USE_ID TURN_ID CONVERSATION [AGENT_ID], control.ts SESSION turn-end TURN_ID answer|aborted [AGENT_ID], or control.ts SESSION session-end clear|resume CONVERSATION",
   );
 }
 // A path through a symlink, such as a linked home directory, names the same

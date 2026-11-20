@@ -1,5 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
+import { dirname } from "node:path";
 import type {
   Caller,
   Decision,
@@ -19,10 +20,18 @@ import {
   type Availability,
   type NativeApproval,
 } from "../policy/native-approval.ts";
-import type { LaunchSpec } from "./launch.ts";
+import {
+  RUNTIME,
+  type HostSession,
+  type LaunchSpec,
+  type RuntimeHost,
+} from "./launch.ts";
+import type { Resample } from "../observations/result.ts";
+import { privateDirectory, write } from "../private-files.ts";
 import {
   CONNECTION_ENV,
-  descendants,
+  DELIVERY_ENV,
+  deliveryPath,
   OWNERSHIP_ENV,
   OwnershipError,
   type Lease,
@@ -34,17 +43,19 @@ import {
   MAX_DEADLINE_MS,
   nonempty,
   object,
-  RpcStream,
   type DeadlineControl,
-  type Request,
 } from "./protocol.ts";
+import { serverInstructions } from "./guidance.ts";
+import { readDisplayScales, type DisplayReader } from "./displays.ts";
 import {
+  fitResult,
   validateArguments,
   validateResult,
-  validateTools,
   type Tool,
 } from "./tool-contracts.ts";
 
+// The MCP version that the launcher speaks to its client. The Codex host
+// speaks MCP to the runtime, and the launcher does not see that version.
 export const PROTOCOL_VERSION = "2025-11-25";
 export type RuntimeState =
   | "discoverable"
@@ -76,20 +87,41 @@ export type SupervisorOptions = {
   // The native session identity of this runtime connection. A random
   // identity when absent.
   connection?: string;
+  // The path of the delivery record of this connection. The supervisor
+  // writes there the digest of each image that it delivered, and the native
+  // guard permits a coordinate pair only for a screenshot of that record.
+  // Without a record the guard refuses each coordinate pair.
+  delivery?: string;
+  // Scales an image above the model limits. The macOS image tool when absent.
+  resample?: Resample;
+  // Reads the scale of each display for the delivery record. The macOS
+  // system report when absent.
+  displays?: DisplayReader;
+  // How long the supervisor uses one reading of the display scales again.
+  displayCacheMs?: number;
 };
+// How long the supervisor uses one reading of the display scales again. The
+// call that sends a coordinate pair often follows its observation at once,
+// and the two then share one reading.
+export const DISPLAY_CACHE_MS = 5000;
+// How many delivered images the delivery record keeps. An older image is
+// far behind in the conversation, so a coordinate pair for it needs a new
+// observation.
+export const DELIVERY_LIMIT = 32;
 type Execution = {
   id: string;
   caller: Caller;
-  token: string;
   deadline: DeadlineControl;
+  // Why the approval boundary refused a request of this call. The Codex
+  // host passes only `cancel` to the runtime, so the result of the call
+  // carries each reason to the model.
+  refusals: string[];
 };
 // The transport deadline for a js call covers its requested execution time
 // plus this margin for result delivery.
 export const JS_DEADLINE_MARGIN_MS = 30000;
 export const CLEANUP_DEADLINE_MS = 10000;
 export const TRANSITION_GRACE_MS = 3000;
-// How long a stopped runtime has to exit after SIGTERM before SIGKILL.
-export const STOP_GRACE_MS = 1000;
 // How many calls of one runtime can wait behind its running call. A call over
 // the limit fails before dispatch.
 export const RUNTIME_QUEUE_LIMIT = 4;
@@ -97,14 +129,10 @@ export const RUNTIME_QUEUE_LIMIT = 4;
 // No app operation: reaching this code proves that the provider ran its banner.
 const BOOTSTRAP =
   'if (typeof cua !== "object" || typeof cua.getApp !== "function" || typeof nodeRepl.rpc !== "function") throw new Error("Required computer facade or trusted-service bridge unavailable");';
-// The browser profile also needs the browser facade. Its check opens no tab.
-const BROWSER_BOOTSTRAP =
-  BOOTSTRAP +
-  ' if (typeof cua.getBrowser !== "function" || typeof cua.getTab !== "function" || typeof cua.createBrowserTab !== "function") throw new Error("Required browser facade unavailable");';
 const turnKey = (turnId: string, agentId?: string) =>
   JSON.stringify([agentId ?? null, turnId]);
 export class RuntimeSupervisor implements ConnectionOwner {
-  private rpc: RpcStream;
+  private host: RuntimeHost;
   private options: SupervisorOptions;
   private state: RuntimeState = "discoverable";
   private generation = randomUUID();
@@ -145,19 +173,32 @@ export class RuntimeSupervisor implements ConnectionOwner {
   private stopping = new AbortController();
   private failure: Error | undefined;
   private starting: Promise<void> | undefined;
-  private child: ChildProcessWithoutNullStreams | undefined;
-  private childExit: Promise<void> | undefined;
-  private init: Record<string, unknown> | undefined;
+  private session: HostSession | undefined;
   private launchDiagnostics: LaunchSpec["diagnostics"] | undefined;
+  private declaredInstructions: string | undefined;
   // The provider's first-use output: the computer API and the Computer Use
   // confirmation policy. The tool description has neither, so the next result
   // that the model receives carries it.
   private banner: ToolResult["content"] = [];
-  // Called once when the owner fails, so the client-facing server can stop.
-  // A deliberate close() does not call it.
+  // The digests of the last images that this supervisor delivered, oldest
+  // first.
+  private deliveredImages: string[] = [];
+  // The last reading of the display scales, with its time. `scales` is null
+  // when the read failed.
+  private displays: {
+    scales: readonly number[] | null;
+    readAt: number;
+  } | null = null;
+  // Called once when the owner fails, so the client-facing server can start
+  // another runtime for the caller at its next call, or stop. A deliberate
+  // close() does not call it.
   onFailed: ((error: Error) => void) | undefined;
+  // Called when a call reaches dispatch: the runtime holds the lease, each
+  // check passed, and the supervisor sends the call to the runtime next. A
+  // call that a check or the lease refused never gets here.
+  onDispatch: (() => void) | undefined;
 
-  constructor(rpc: RpcStream, options: SupervisorOptions) {
+  constructor(host: RuntimeHost, options: SupervisorOptions) {
     if (!nonempty(options.sessionId))
       throw new ConnectionError(
         "state",
@@ -177,33 +218,82 @@ export class RuntimeSupervisor implements ConnectionOwner {
         options.approvalTimeoutMs > 2147483647)
     )
       throw new ConnectionError("configuration", "Invalid approval timeout");
-    this.rpc = rpc;
+    this.host = host;
     this.options = Object.freeze({ ...options });
     this.grantSession =
       options.connection ?? `claude-cua-connection-${randomUUID()}`;
-    rpc.onRequest = (request) => this.serverRequest(request);
-    rpc.onNotification = (notification) => {
-      if (
-        notification.method === "notifications/cancelled" &&
-        object(notification.params)
-      ) {
-        for (const pending of this.requests.values()) {
-          if (pending.request.id === notification.params.requestId) {
-            this.answer(pending, { action: "cancel" });
-            break;
-          }
+    host.onApproval = (request) => this.approvalRequest(request);
+    host.onWithdrawn = (id) => {
+      for (const pending of this.requests.values())
+        if (pending.request.id === id) {
+          this.withdraw(pending);
+          break;
         }
-      }
-      if (notification.method === "notifications/tools/list_changed")
-        this.fail(
-          new ConnectionError(
-            "protocol",
-            "Tool catalog changed; reconnect and validate before further dispatch",
-          ),
-        );
     };
-    rpc.onFailure = (error) => this.fail(error);
+    host.onFailure = (error) => this.fail(error);
+    // A record of an earlier process with the same path names no image of
+    // this connection.
+    this.recordDelivery([]);
   }
+  // Writes the delivery record before the result of a call returns. The
+  // model sends its next call only after it received that result, so the
+  // guard reads a current record at each coordinate request. A record that
+  // the supervisor cannot write stays as it was, and the guard then refuses
+  // a coordinate pair for the new image.
+  private recordDelivery(images: readonly string[]) {
+    const path = this.options.delivery;
+    if (path === undefined) return;
+    this.deliveredImages = [...this.deliveredImages, ...images].slice(
+      -DELIVERY_LIMIT,
+    );
+    try {
+      privateDirectory(dirname(path));
+      write(path, {
+        connection: this.grantSession,
+        images: this.deliveredImages,
+        displays: this.displays,
+      });
+    } catch {
+      /* The guard refuses a coordinate pair for an image without a record. */
+    }
+  }
+  // Reads the display scales for the delivery record, unless the last
+  // reading is younger than the cache time. The native guard permits a
+  // coordinate pair only with a reading of the measured scale that is not
+  // older than its own limit, so a reading that the supervisor does not
+  // renew can cause a refusal and no permission. A person can connect or
+  // remove a display at each time. When a reading differs from the last
+  // one, each window can be on another display, so each delivered image
+  // loses its coordinate pairs.
+  private async readDisplays() {
+    if (this.options.delivery === undefined) return;
+    if (
+      this.displays &&
+      Date.now() - this.displays.readAt <
+        (this.options.displayCacheMs ?? DISPLAY_CACHE_MS)
+    )
+      return;
+    const scales =
+      (await (this.options.displays ?? readDisplayScales)().catch(
+        () => undefined,
+      )) ?? null;
+    if (
+      this.displays &&
+      JSON.stringify(this.displays.scales) !== JSON.stringify(scales)
+    )
+      this.deliveredImages = [];
+    this.displays = { scales, readAt: Date.now() };
+  }
+  // The runtime of this record is gone, so the record names no image that a
+  // guard can use.
+  private removeDelivery() {
+    if (this.options.delivery !== undefined)
+      rmSync(this.options.delivery, { force: true });
+  }
+  // Starts the Codex host of one caller runtime. The native guard in the
+  // trusted worker of the runtime reads the lease file and compares its
+  // holder with this connection, so the declaration of the runtime server
+  // names both.
   static launch(
     spec: LaunchSpec,
     options: SupervisorOptions,
@@ -225,64 +315,45 @@ export class RuntimeSupervisor implements ConnectionOwner {
       );
     const connection =
       options.connection ?? `claude-cua-connection-${randomUUID()}`;
-    // The native guard in the runtime's trusted worker reads the lease file
-    // and compares its holder with this connection.
-    const child = spawn(spec.command, [...spec.args], {
-      env: {
-        ...spec.env,
-        ...(options.ownership
-          ? {
-              [OWNERSHIP_ENV]: options.ownership.path,
-              [CONNECTION_ENV]: connection,
-            }
-          : {}),
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const supervisor = new RuntimeSupervisor(
-      new RpcStream(child.stdout, child.stdin),
-      { ...options, connection },
+    // The delivery record is next to the lease file, in the private
+    // directory of the launcher.
+    const delivery =
+      options.delivery ??
+      (options.ownership
+        ? deliveryPath(connection, dirname(options.ownership.path))
+        : undefined);
+    const host = RUNTIME.launch(
+      spec,
+      options.ownership
+        ? {
+            [OWNERSHIP_ENV]: options.ownership.path,
+            [CONNECTION_ENV]: connection,
+            ...(delivery === undefined ? {} : { [DELIVERY_ENV]: delivery }),
+          }
+        : {},
     );
-    supervisor.child = child;
-    // The installed launcher starts its executor with inherited stdio, so the
-    // executor can outlive the launcher process. The output pipe closes only
-    // when every process that holds it has exited.
-    const closed = new Promise<void>((resolve) =>
-      child.stdout.once("close", () => resolve()),
-    );
-    supervisor.childExit = new Promise((resolve) => {
-      child.once("exit", () => void closed.then(resolve));
-      child.once("error", () => {
-        if (child.pid === undefined) resolve();
+    let supervisor: RuntimeSupervisor;
+    try {
+      supervisor = new RuntimeSupervisor(host, {
+        ...options,
+        connection,
+        ...(delivery === undefined ? {} : { delivery }),
       });
-    });
+    } catch (error) {
+      host.stop();
+      throw error;
+    }
     supervisor.launchDiagnostics = spec.diagnostics;
-    // Drain stderr separately. Diagnostics never retain arbitrary cell output.
-    child.stderr.resume();
-    child.on("error", (error) =>
-      supervisor.fail(
-        new ConnectionError(
-          "transport",
-          `Runtime launch failed: ${error.message}`,
-        ),
-      ),
-    );
-    child.on("exit", (code, signal) =>
-      supervisor.fail(
-        new ConnectionError(
-          "transport",
-          `Runtime exited (${code ?? signal}); external effect unknown`,
-        ),
-      ),
-    );
+    supervisor.declaredInstructions = spec.instructions;
     return supervisor;
   }
   health() {
     return structuredClone({
       state: this.state,
       runtimeGeneration: this.generation,
-      server: this.init?.serverInfo,
-      protocolVersion: this.init?.protocolVersion,
+      server: this.session?.server,
+      host: this.session?.userAgent,
+      hostPid: this.host.pid,
       launch: this.launchDiagnostics,
       failure: this.failure?.message,
       nativePermission: "unverified",
@@ -291,12 +362,16 @@ export class RuntimeSupervisor implements ConnectionOwner {
         "No rollback guarantee. Reset clears bindings, not apps or permissions.",
     });
   }
+  // The catalog stays readable after a failure. The launcher lists it to the
+  // client until the next runtime of the caller starts.
   catalog(): Tool[] {
-    this.available();
     return structuredClone(this.tools);
   }
-  serverInfo() {
-    return structuredClone(this.init);
+  // The server instructions for the model: the instructions that the
+  // configuration declares, if any, and then the operating guidance of this
+  // integration.
+  instructions(): string {
+    return serverInstructions(this.declaredInstructions);
   }
   start(): Promise<void> {
     if (this.starting) return this.starting;
@@ -306,34 +381,10 @@ export class RuntimeSupervisor implements ConnectionOwner {
   private async initialize() {
     try {
       this.available();
-      const value = await this.rpc.request(
-        "initialize",
-        {
-          protocolVersion: PROTOCOL_VERSION,
-          capabilities: { elicitation: { form: {} } },
-          clientInfo: { name: "claude-cua-owner", version: "0.1.0" },
-        },
-        this.options.deadlineMs,
-      );
-      if (
-        !object(value) ||
-        value.protocolVersion !== PROTOCOL_VERSION ||
-        !object(value.capabilities) ||
-        !object(value.capabilities.tools) ||
-        !object(value.serverInfo) ||
-        !nonempty(value.serverInfo.name) ||
-        !nonempty(value.serverInfo.version)
-      )
-        throw new ConnectionError(
-          "protocol",
-          "Unsupported protocol, missing tools capability, or invalid server identity",
-        );
+      const session = await this.host.start(this.options.deadlineMs);
       this.available();
-      this.init = value;
-      this.rpc.notify("notifications/initialized");
-      this.tools = validateTools(
-        await this.rpc.request("tools/list", {}, this.options.deadlineMs),
-      );
+      this.tools = RUNTIME.validateCatalog(session.catalog);
+      this.session = session;
       this.available();
       this.state = "initialized";
       await this.bootstrap();
@@ -344,18 +395,9 @@ export class RuntimeSupervisor implements ConnectionOwner {
   }
   private async bootstrap() {
     const result = validateResult(
-      await this.rpc.request(
-        "tools/call",
-        {
-          name: "js",
-          arguments: {
-            code: this.launchDiagnostics?.surfaces.includes("browser")
-              ? BROWSER_BOOTSTRAP
-              : BOOTSTRAP,
-          },
-        },
-        this.options.deadlineMs,
-      ),
+      await this.host.call("js", { code: BOOTSTRAP }, undefined, {
+        ms: this.options.deadlineMs,
+      }),
     );
     if (result.isError)
       throw new ConnectionError(
@@ -407,10 +449,14 @@ export class RuntimeSupervisor implements ConnectionOwner {
         "Unknown caller identity or stale runtime generation",
       );
   }
+  // `underLease` runs after this runtime took the lease and before the call
+  // reaches the runtime. The native check opens its document there, so the
+  // document appears only while this runtime may act on the desktop.
   async call(
     caller: Caller,
     tool: string,
     args: Record<string, Json>,
+    underLease?: () => Promise<void>,
   ): Promise<ToolResult> {
     this.available();
     if (this.state !== "ready")
@@ -450,6 +496,26 @@ export class RuntimeSupervisor implements ConnectionOwner {
         this.available();
         this.validateCaller(savedCaller);
         this.options.beforeDispatch?.();
+        if (underLease) {
+          // The step can take seconds. The gate, the runtime, and the caller
+          // can change in that time, so each check runs again before the
+          // call reaches the runtime.
+          await underLease();
+          this.available();
+          this.validateCaller(savedCaller);
+          this.options.beforeDispatch?.();
+        }
+        // A call can send a coordinate pair only after the launcher
+        // delivered an image. Such a call starts with a current reading of
+        // the display scales in the delivery record. The read takes time,
+        // so each check runs again after it.
+        if (this.deliveredImages.length > 0) {
+          await this.readDisplays();
+          this.recordDelivery([]);
+          this.available();
+          this.validateCaller(savedCaller);
+          this.options.beforeDispatch?.();
+        }
         return await this.execute(savedCaller, tool, savedArgs);
       } finally {
         this.release(lease);
@@ -467,13 +533,15 @@ export class RuntimeSupervisor implements ConnectionOwner {
     const ownership = this.options.ownership;
     if (!ownership) return undefined;
     try {
-      const runtimePid = this.child?.pid;
+      // The lease records the Codex host and each process that it started,
+      // which includes the runtime and its executors.
+      const runtimePid = this.host.pid;
       return await ownership.acquire(
         {
           connection: this.grantSession,
           ...(runtimePid === undefined
             ? {}
-            : { runtimePid, executorPids: descendants(runtimePid) }),
+            : { runtimePid, executorPids: this.host.processes() }),
           sessionId: caller.sessionId,
           ...(caller.agentId === undefined ? {} : { agentId: caller.agentId }),
           toolUseId: caller.toolUseId,
@@ -503,36 +571,64 @@ export class RuntimeSupervisor implements ConnectionOwner {
     const execution: Execution = {
       id: randomUUID(),
       caller: savedCaller,
-      token: randomUUID(),
       deadline: { pause() {}, resume() {} },
+      refusals: [],
     };
     this.active = execution;
     this.turns.add(turnKey(savedCaller.turnId, savedCaller.agentId));
     try {
+      this.onDispatch?.();
+    } catch {
+      /* A failing listener cannot change the call. */
+    }
+    try {
       let result = validateResult(
-        await this.rpc.request(
-          "tools/call",
+        await this.host.call(
+          tool,
+          savedArgs,
+          // The runtime returns this object in each approval request of the
+          // call. The approval boundary compares it with the running call.
           {
-            name: tool,
-            arguments: savedArgs,
-            _meta: {
-              progressToken: execution.token,
-              "x-codex-turn-metadata": {
-                session_id: this.grantSession,
-                turn_id: savedCaller.turnId,
-                call_id: savedCaller.toolUseId,
-                ...(savedCaller.agentId
-                  ? { agent_id: savedCaller.agentId }
-                  : {}),
-              },
+            "x-codex-turn-metadata": {
+              session_id: this.grantSession,
+              turn_id: savedCaller.turnId,
+              call_id: savedCaller.toolUseId,
+              ...(savedCaller.agentId ? { agent_id: savedCaller.agentId } : {}),
             },
           },
-          this.deadlineFor(tool, savedArgs),
-          () => this.expire(execution),
-          execution.deadline,
+          {
+            ms: this.deadlineFor(tool, savedArgs),
+            settled: () => this.expire(execution),
+            control: execution.deadline,
+          },
         ),
       );
       this.available();
+      // The model receives each image at the size that a coordinate pair
+      // refers to.
+      // A result with an image also needs a reading of the display scales
+      // for the delivery record. The two steps run at the same time.
+      const [fitted] = await Promise.all([
+        fitResult(result, this.options.resample),
+        result.content.some((block) => block.type === "image")
+          ? this.readDisplays()
+          : undefined,
+      ]);
+      // The image tool can run for seconds, and the host can exit in that
+      // time. A failed runtime returns no result.
+      this.available();
+      result = fitted.result;
+      if (execution.refusals.length > 0)
+        result = {
+          ...result,
+          content: [
+            ...execution.refusals.map((reason) => ({
+              type: "text",
+              text: `The launcher cancelled an approval request of this call. ${reason}`,
+            })),
+            ...result.content,
+          ],
+        };
       if (this.banner.length > 0) {
         result = { ...result, content: [...this.banner, ...result.content] };
         this.banner = [];
@@ -550,9 +646,13 @@ export class RuntimeSupervisor implements ConnectionOwner {
           this.state = "initialized";
         }
       }
+      // The server sends no result of a call that its client abandoned, so
+      // the model does not receive the images of such a call.
+      if (!this.abandoned.has(savedCaller.toolUseId))
+        this.recordDelivery(fitted.delivered);
       return result;
     } catch (error) {
-      // A JSON-RPC error has no trustworthy kernel recovery contract. A content
+      // A protocol error has no trustworthy kernel recovery contract. A content
       // failure arrived in a valid, correlated response, so only the call fails.
       if (!(error instanceof ConnectionError && error.kind === "content"))
         this.fail(error instanceof Error ? error : new Error(String(error)));
@@ -588,39 +688,25 @@ export class RuntimeSupervisor implements ConnectionOwner {
       this.approvalTimers.delete(id);
       this.pendingClosed(id);
       try {
-        this.rpc.error(
-          pending.request.id,
-          -32000,
-          "Execution is no longer active",
-        );
+        this.host.refuse(pending.request.id);
       } catch {
         /* Transport may already be closed. */
       }
     }
   }
-  private serverRequest(request: Request) {
-    if (request.method === "ping") {
-      this.rpc.result(request.id, {});
-      return;
-    }
-    if (request.method !== "elicitation/create") {
-      this.rpc.error(
-        request.id,
-        -32601,
-        `Unsupported required host request: ${request.method}`,
-      );
-      return;
-    }
+  // An approval request of the runtime, which the Codex host accepted for
+  // the thread and the server of this runtime. The request runs no further
+  // unless its metadata names the running call.
+  private approvalRequest(request: ServerRequest) {
     const params = request.params;
     if (
-      !object(params) ||
       params.mode !== "form" ||
       !nonempty(params.message) ||
       !object(params.requestedSchema) ||
       params.requestedSchema.type !== "object" ||
       !object(params._meta)
     ) {
-      this.rpc.error(request.id, -32602, "Unsupported elicitation payload");
+      this.host.refuse(request.id);
       return;
     }
     const execution = this.active;
@@ -636,39 +722,32 @@ export class RuntimeSupervisor implements ConnectionOwner {
       (params._meta.tool_call_id !== undefined &&
         params._meta.tool_call_id !== execution.caller.toolUseId)
     ) {
-      this.rpc.error(
-        request.id,
-        -32000,
-        "Obsolete or uncorrelated host request",
-      );
+      this.host.refuse(request.id);
       return;
     }
     // A call that a transition retired can catch its cancellation and ask
     // again. No decision could resolve that request, so it is cancelled now.
     if (execution.caller.runtimeGeneration !== this.generation) {
-      this.rpc.result(request.id, { action: "cancel" });
+      this.host.refuse(request.id);
       return;
     }
     let approval: NativeApproval;
     try {
-      approval = nativeApproval(request as ServerRequest);
+      approval = nativeApproval(request);
     } catch (error) {
-      this.rpc.error(
-        request.id,
-        -32602,
+      // No answer of a person can satisfy a request outside the approval
+      // boundary, so the runtime receives a cancel.
+      execution.refusals.push(
         error instanceof Error ? error.message : "Unsupported approval",
       );
+      this.host.refuse(request.id);
       return;
     }
-    // The Codex app holds lasting browser permissions, and the browser
-    // service keeps each browser answer itself. So the launcher keeps no
-    // browser grant and passes the answer through (decision 0002).
-    const browser = approval.kind !== "app";
     // A session grant answers with a plain accept. The native wrapper still
     // receives that accept and applies its own checks to the operation.
-    if (!browser && this.reusable(execution.caller, approval)) {
+    if (this.reusable(execution.caller, approval)) {
       this.reused++;
-      this.rpc.result(request.id, { action: "accept", content: {} });
+      this.host.answer(request.id, { action: "accept", content: {} });
       try {
         this.onGrantReused?.();
       } catch {
@@ -677,12 +756,12 @@ export class RuntimeSupervisor implements ConnectionOwner {
       return;
     }
     const available: Availability = {
-      scopes: browser || this.options.grants ? approval.scopes : ["once"],
+      scopes: this.options.grants ? approval.scopes : ["once"],
     };
     const pending = Object.freeze({
       operationId: randomUUID(),
       caller: execution.caller,
-      request: structuredClone(request) as ServerRequest,
+      request: structuredClone(request),
     });
     this.requests.set(pending.operationId, pending);
     this.availability.set(pending.operationId, { approval, available });
@@ -709,6 +788,16 @@ export class RuntimeSupervisor implements ConnectionOwner {
       if (this.requests.has(pending.operationId))
         this.answer(pending, { action: "cancel" });
     }
+  }
+  // The Codex host reported that a pending request needs no answer. The
+  // request closes without one.
+  private withdraw(pending: PendingRequest) {
+    clearTimeout(this.approvalTimers.get(pending.operationId));
+    this.approvalTimers.delete(pending.operationId);
+    this.requests.delete(pending.operationId);
+    this.availability.delete(pending.operationId);
+    this.pendingClosed(pending.operationId);
+    if (this.requests.size === 0) this.active?.deadline.resume();
   }
   private pendingClosed(operationId: string) {
     try {
@@ -783,12 +872,10 @@ export class RuntimeSupervisor implements ConnectionOwner {
         offered?.available.scopes ?? ["once"],
       );
       // A session grant is recorded before the runtime receives the accept.
-      // A browser answer passes through: the browser service keeps it, and
-      // the launcher keeps no browser grant.
       if (
         resolved.action === "accept" &&
         decision.content?.scope === "session" &&
-        offered?.approval.kind === "app"
+        offered
       )
         this.options.grants!.record(offered.approval);
     } catch (error) {
@@ -802,7 +889,7 @@ export class RuntimeSupervisor implements ConnectionOwner {
     this.pendingClosed(pending.operationId);
     // Sending the decision can complete the call before result() returns.
     const execution = this.active;
-    this.rpc.result(current.request.id, resolved);
+    this.host.answer(current.request.id, resolved);
     if (this.requests.size === 0 && this.active === execution)
       execution.deadline.resume();
     if (invalid) throw invalid;
@@ -826,10 +913,9 @@ export class RuntimeSupervisor implements ConnectionOwner {
           : event.isAborted
             ? "Interrupt"
             : "Stop",
-      // The session that the calls of this runtime carried. The browser
-      // service keys the tabs that a call created or claimed by that session,
-      // also for a subagent: its calls carry no Codex thread identity, which
-      // the installed plugin's subagent mapping would need.
+      // The session that the calls of this runtime carried, also for a
+      // subagent: its calls carry no Codex thread identity, which the
+      // installed plugin's subagent mapping would need.
       session_id: this.grantSession,
       turn_id: event.turnId,
     };
@@ -855,11 +941,9 @@ export class RuntimeSupervisor implements ConnectionOwner {
       }
       try {
         const result = validateResult(
-          await this.rpc.request(
-            "tools/call",
-            { name: "turn_ended", arguments: args },
-            this.options.cleanupDeadlineMs ?? CLEANUP_DEADLINE_MS,
-          ),
+          await this.host.call("turn_ended", args, undefined, {
+            ms: this.options.cleanupDeadlineMs ?? CLEANUP_DEADLINE_MS,
+          }),
         );
         return result.isError
           ? `Turn end ${args.hook_event_name} returned an error${unowned}; cleanup state unknown`
@@ -884,18 +968,7 @@ export class RuntimeSupervisor implements ConnectionOwner {
   // A clear or resume starts another conversation in the same process. No call
   // or approval of the old conversation may act in the new one.
   private transition(reason: string): Promise<string> {
-    // Calls queued before the transition carry the old generation and fail its
-    // caller check, so none of them runs in the new conversation. The
-    // generation changes first: a script can answer a cancel at once with a
-    // new approval request, which must already meet the retired generation.
-    this.generation = randomUUID();
-    for (const pending of this.pending())
-      try {
-        this.answer(pending, { action: "cancel" });
-      } catch {
-        /* The approval already closed. */
-      }
-    this.turns.clear();
+    this.retire();
     // The running call belongs to the old conversation. The reset waits
     // behind it, so a call that does not end in time fails the runtime.
     const retired = this.active;
@@ -912,13 +985,13 @@ export class RuntimeSupervisor implements ConnectionOwner {
       timer.unref();
     }
     const work = this.tail.then(async () => {
-      this.available();
+      // A runtime that stopped has no bindings to discard.
+      if (this.state === "failed" || this.state === "stopped")
+        return `Conversation ${reason}: reset skipped, because the runtime stopped (${this.failure?.message ?? "closed"})`;
       const result = validateResult(
-        await this.rpc.request(
-          "tools/call",
-          { name: "js_reset", arguments: {} },
-          this.options.deadlineMs,
-        ),
+        await this.host.call("js_reset", {}, undefined, {
+          ms: this.options.deadlineMs,
+        }),
       );
       if (result.isError)
         throw new ConnectionError(
@@ -935,8 +1008,27 @@ export class RuntimeSupervisor implements ConnectionOwner {
       return `Conversation ${reason}: reset failed, so the runtime stopped (${error instanceof Error ? error.message : String(error)})`;
     });
   }
+  // Retires the generation: no call and no approval of it can act from now
+  // on. A conversation transition and a failure both start with this step.
+  // Calls queued before it carry the old generation and fail the caller
+  // check. The generation changes first: a script can answer a cancel at once
+  // with a new approval request, which must already meet the retired
+  // generation.
+  private retire() {
+    this.generation = randomUUID();
+    for (const pending of this.pending())
+      try {
+        this.answer(pending, { action: "cancel" });
+      } catch {
+        /* The approval already closed, or the host is gone. */
+      }
+    this.turns.clear();
+  }
+  // The runtime stops, and its state is unknown from now on. The launcher
+  // starts another runtime for the caller at its next call.
   private fail(error: Error) {
     if (this.state === "stopped" || this.state === "failed") return;
+    this.retire();
     this.state = "failed";
     this.failure = error;
     this.stopping.abort();
@@ -945,30 +1037,18 @@ export class RuntimeSupervisor implements ConnectionOwner {
     this.requests.clear();
     this.availability.clear();
     this.active = undefined;
-    this.rpc.fail(error);
-    this.stopChild();
+    this.removeDelivery();
+    this.host.stop(error);
     try {
       this.onFailed?.(error);
     } catch {
       /* A failing listener cannot change the failed state. */
     }
   }
-  // The kill timer keeps the process alive, so the launcher cannot exit and
-  // release session ownership while the runtime can still act.
-  private stopChild() {
-    const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) return;
-    child.kill("SIGTERM");
-    const timer = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null)
-        child.kill("SIGKILL");
-    }, STOP_GRACE_MS);
-    child.once("exit", () => clearTimeout(timer));
-  }
-  // Resolves when the runtime process has exited, or at once when this owner
-  // has no process.
+  // Resolves when the Codex host and each process that it started have
+  // exited, or at once when this owner has no process.
   exited(): Promise<void> {
-    return this.childExit ?? Promise.resolve();
+    return this.host.exited();
   }
   close() {
     if (this.state === "stopped") return;
@@ -979,7 +1059,7 @@ export class RuntimeSupervisor implements ConnectionOwner {
     this.requests.clear();
     this.availability.clear();
     this.active = undefined;
-    this.rpc.close();
-    this.stopChild();
+    this.removeDelivery();
+    this.host.stop();
   }
 }
