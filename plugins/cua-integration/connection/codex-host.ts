@@ -522,7 +522,11 @@ export class CodexHost implements RuntimeHost {
       );
       return;
     }
-    const { threadId, serverName, turnId, ...params } = object(request.params)
+    // Codex CLI 0.171 adds `environmentId`, which is the registration scope
+    // of the server. The launcher registers the server in no environment.
+    const { threadId, serverName, turnId, environmentId, ...params } = object(
+      request.params,
+    )
       ? request.params
       : {};
     if (
@@ -530,7 +534,8 @@ export class CodexHost implements RuntimeHost {
       threadId !== this.thread ||
       serverName !== this.name ||
       // The launcher starts no model turn.
-      (turnId !== undefined && turnId !== null)
+      (turnId !== undefined && turnId !== null) ||
+      (environmentId !== undefined && environmentId !== null)
     ) {
       this.refuse(request.id);
       return;

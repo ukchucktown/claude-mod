@@ -1,5 +1,5 @@
 {
-  "adapterVersion": "0.3.2",
+  "adapterVersion": "0.3.3",
   "nodeBaseline": "24.21.0",
   "nodeMajors": {
     "minimum": 24,
@@ -40,6 +40,11 @@
       "clientVersion": "2.1.329",
       "sha256": "aec7b446af0d3b0ebb883d4139909fec66465dafe33ddd559111d7fc913b1803",
       "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.329 writes beside a plugin that it loads. The Mod type-checks against it. Against 2.1.328, it adds the `agent.report` hook and theme types, adds the value `unanswered` to the refusal of a prompt fill, and changes comments. The Mod uses none of these."
+    },
+    {
+      "clientVersion": "2.1.330",
+      "sha256": "c41b7f1ac2fac7a6b90bc50b7a78ad1dc791778a71cedcd87dd3b34c75b89748",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.330 writes beside a plugin that it loads. The Mod type-checks against it. No copy of the 2.1.329 set was available, so no comparison of the two texts exists."
     }
   ],
   "runtimePackages": {
@@ -53,15 +58,15 @@
       "record": "docs/implementation/cli-acceptance.json",
       "result": "pass",
       "host": "Interactive Claude Code CLI on local macOS",
-      "clientVersion": "2.1.329",
-      "runtimePluginVersion": "26.1111.71704",
+      "clientVersion": "2.1.330",
+      "runtimePluginVersion": "26.1117.31558",
       "packages": {
-        "@oai/cua-repl": "0.1.5",
-        "@oai/cua": "0.2.7",
-        "@oai/sky": "0.7.21",
-        "codex-cli": "0.169.1"
+        "@oai/cua-repl": "0.1.6",
+        "@oai/cua": "0.2.8",
+        "@oai/sky": "0.7.24",
+        "codex-cli": "0.171.0-alpha.13"
       },
-      "appVersion": "26.1111.71704"
+      "appVersion": "26.1117.31558"
     }
   ],
   "feasibilityOnly": {

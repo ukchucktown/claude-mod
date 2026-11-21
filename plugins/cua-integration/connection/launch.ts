@@ -165,6 +165,8 @@ const ENV_KEYS = new Set([
   "SKY_CUA_SERVICE_PATH",
   "CODEX_CLI_PATH",
   "CUA_REPL_ENABLED_SURFACES",
+  "CUA_REPL_OMIT_CONFIRMATION_POLICY",
+  "NODE_REPL_LAZY_TRUSTED_WORKER",
   "NODE_REPL_JS_BANNER",
   "NODE_REPL_JS_COMPLETION_SUMMARY",
   "NODE_REPL_TOOL_OVERRIDES",
@@ -187,6 +189,7 @@ const REVIEWED_BANNER = 'await import("@oai/cua/tinyskyAlt");';
 const REVIEWED_UNTRUSTED_ENV = new Set([
   "CUA_REPL_ENABLED_SURFACES",
   "CUA_REPL_BROWSER_ENV",
+  "CUA_REPL_OMIT_CONFIRMATION_POLICY",
 ]);
 function parsed(value: string): unknown {
   try {
@@ -254,6 +257,21 @@ const ENV_CONTRACTS: Readonly<
       }
     }
     return undefined;
+  },
+  // The runtime of plugin 26.1117.31558 declares the value 0. The function
+  // of the entry is not reviewed, so each other value refuses.
+  NODE_REPL_LAZY_TRUSTED_WORKER: (value) =>
+    value === "0" ? undefined : "the value is not the reviewed value 0",
+  // A map from a product SKU to a boolean. For a SKU with the value true,
+  // the banner import omits the confirmation policy text from the
+  // documentation that the model reads. Thus, only false values pass.
+  CUA_REPL_OMIT_CONFIRMATION_POLICY: (value) => {
+    const policy = parsed(value);
+    if (!object(policy)) return "the value is not a JSON object";
+    const sku = Object.keys(policy).find((key) => policy[key] !== false);
+    return sku === undefined
+      ? undefined
+      : `the confirmation policy text would be omitted for ${sku || "an empty name"}`;
   },
   NODE_REPL_JS_COMPLETION_SUMMARY: (value) => {
     const summary = parsed(value);
