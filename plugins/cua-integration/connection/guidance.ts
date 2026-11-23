@@ -1,3 +1,8 @@
+import {
+  pixelOnlyWindow,
+  RESULT_LIMIT_CHARACTERS,
+} from "../native/sky-guard.ts";
+
 // The operating guidance that this integration gives to the model, as a part
 // of the server instructions. The guidance is advisory: it enforces nothing,
 // and the native guard stays the enforcement point. Each rule names its
@@ -199,6 +204,53 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = Object.freeze([
     sources: [record("browser-runtime.json", "select")],
   },
 ]);
+
+// The note for a window with no accessibility content, for example the
+// window of a remote desktop client. The guidance text is in the context of
+// each session and is at its limit, and most sessions meet no such window.
+// Thus, the launcher gives these rules as a note in the first result that
+// shows such a window (issue #123). The pixel window record gives the source
+// of the form of the window, of the sentence on a late change, and of the
+// sentence on a scroll with no effect. The key Page_Down and a drag of the
+// scroll bar moved a page of a remote desktop in a session of 2026-11-22,
+// and no committed record holds that session.
+//
+// The note is a constant text. It holds no word of a result, because the
+// text of a result can come from the content of an app, and a note of the
+// launcher must not carry such content.
+export const PIXEL_WINDOW_NOTE =
+  "Note of the launcher: a window in this result shows no controls to the accessibility interface, so only its screenshot shows its content, as for a remote desktop. For such a window, use a coordinate pair of the last screenshot, or `pressKey` and `typeText`. `scroll` can have no effect there: use `pressKey` with Page_Down or Page_Up, or `drag` the scroll bar. The content can change after an observation returns: when a screenshot does not show the result of an input, observe again. To read small text, use the tool `screenshot_region`.";
+// The first line of the text of an observation, as the facade prints it.
+const OBSERVATION_HEADER = /^Window: ".*", App: (.+)\.$/;
+// The longest app name that the launcher keeps as a key.
+const APP_KEY_LIMIT = 200;
+// The app of a text block that is the text of one observation of a window
+// with no accessibility content, or undefined. The block must start with the
+// line that names the window and the app. A line of that form inside a
+// block can come from the content of an app, for example from a web page,
+// so the launcher does not read it. The app name is a key for the launcher
+// only, and no note holds it.
+export function pixelOnlyApp(text: string): string | undefined {
+  const lines = text.split("\n");
+  const header = OBSERVATION_HEADER.exec(lines[0] ?? "");
+  if (!header || !pixelOnlyWindow(lines.slice(1).join("\n"))) return undefined;
+  return header[1]!.slice(0, APP_KEY_LIMIT);
+}
+
+// The size of one result at which the result does not arrive, in megabytes
+// of 1024 by 1024 characters.
+export const RESULT_LIMIT_MEGABYTES = RESULT_LIMIT_CHARACTERS / (1024 * 1024);
+// The text that the launcher adds to the failure of a `js` call whose result
+// did not arrive before the transport deadline. The runtime ends a script at
+// its own time limit, so the script of such a call ended, or the runtime
+// stopped. The size of the result is the one cause that a record shows.
+export const RESULT_SIZE_HINT = `The result of this call did not arrive. One known cause is the size of the result: a result with ${RESULT_LIMIT_MEGABYTES} MB or more does not arrive, and an image counts with four thirds of its size. Write less text and emit fewer images in one call.`;
+// The note that takes the place of the documentation of the runtime when the
+// runtime prints it a second time in a conversation. The runtime prints its
+// documentation again after it reset its script state, for example after a
+// script reached its time limit or after a time with no call.
+export const RESET_NOTE =
+  "Note of the launcher: the runtime reset its script state, so each variable and each app binding is gone. Bind each app again with `getApp`. The documentation of the runtime is in the first result of this conversation, and the launcher does not repeat it here. A call with `cua.rewriteDocumentation()` gives it again.";
 
 const INTRODUCTION =
   "These rules add to the documentation in the first `js` result and apply where it differs. The launcher refuses an input that breaks an input rule.";

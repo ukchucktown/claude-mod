@@ -4,7 +4,9 @@ A Claude Code marketplace for the mods of ukchucktown. The marketplace has one p
 
 ## cua-integration
 
-`cua-integration` lets Claude Code operate native macOS apps through the Computer Use runtime of the ChatGPT app. Claude observes an app through its accessibility tree and screenshots, and it acts on an element by its index in that tree. Each app operation asks for your approval in a Claude Code dialog, unless the Codex app already permits the app.
+`cua-integration` lets Claude Code operate native macOS apps. The plugin is a wrapper of the Computer Use runtime that the ChatGPT app installs, which is the runtime that Codex uses. The plugin puts a Claude Code approval dialog and a guard between Claude and that runtime. Claude observes an app through its accessibility tree and screenshots, and it acts on an element by its index in that tree. Each app operation asks for your approval in a Claude Code dialog, unless the Codex app already permits the app.
+
+The plugin needs the ChatGPT app on the Mac, and it needs no ChatGPT or Codex subscription. It uses no OpenAI model, and it reads no OpenAI login. A check with Computer Use service 26.1116.1001980 ran on a Mac with no Codex login, and an observation and a click of an app passed. The check did not include an account on a free plan. It also did not show whether the ChatGPT app installs its Computer Use plugin before you sign in. The Computer Use service is software of OpenAI, and it makes network requests that the plugin does not control.
 
 This release supports one host profile on a local Mac: the interactive terminal Claude Code CLI, with no remote client attached.
 
@@ -12,11 +14,26 @@ The plugin also runs in Claude Code Desktop, with no other client attached, but 
 
 In the CLI and in Desktop, a person must answer each approval dialog. The plugin refuses each call in a headless run, in an Agent SDK host, in the VS Code extension panel, in a cloud session, and while a remote client, such as Remote Control, is attached. The [host support page](docs/host-support.md) lists each surface and the versions that the release was tested with.
 
-The plugin does not support these capabilities:
+## Capabilities
 
-- Coordinate input and drag. Claude can click, scroll, and drag at a point of a screenshot, but this release makes no support claim for that input: its check used one app on one display.
-- Control of a browser through the Chrome extension of the ChatGPT app. For this plugin, a browser is a native app: Claude operates it through the accessibility tree and the screenshots of its window, as it operates each other app. The release was tested with Google Chrome only. An approval of a browser lets Claude read the title of each tab of the observed window.
-- More than one caller that controls apps at the same time.
+By element index, Claude can do these operations in an app:
+
+- Click an element, or run a secondary action that the element advertises, such as `Scroll Up`.
+- Set the value of a text field, type text, paste text, and select text.
+- Press a key or a key chord.
+- Scroll.
+
+For this plugin, a browser is a native app: Claude operates it through the accessibility tree and the screenshots of its window, as it operates each other app. In a browser, Claude can also load a URL through the address bar, select an option of a `select` element, select a tab, and close a tab. The release was tested with Google Chrome only. An approval of a browser lets Claude read the title of each tab of the observed window.
+
+These capabilities work, but the release has little evidence for them and makes no support claim:
+
+- Coordinate input and drag. Claude can click, scroll, and drag at a point of a screenshot. The checks of this input used one app, on displays with 2 pixels for each point. The plugin refuses this input unless each display of the Mac has 2 pixels for each point.
+- A window with no accessibility content, such as the window of a remote desktop client. Claude sees such a window only in its screenshot, so it needs coordinate input and keys there. The plugin tells Claude the rules for such a window, and it waits a settle time after each input before the next observation. The check used one remote desktop window.
+- More than one caller at the same time, such as a main session and a subagent. Each caller gets its own runtime, and only one caller at a time acts on an app. No check with two Claude Code callers ran.
+
+This capability is not available:
+
+- Control of a browser through the Chrome extension of the ChatGPT app.
 
 ## Requirements
 
@@ -24,7 +41,7 @@ The plugin does not support these capabilities:
 - Node 24, 25, or 26 as `node` on the `PATH` of Claude Code. For Claude Code Desktop, your login shell profile must put that Node on the `PATH`, because Desktop builds the `PATH` of each session from it.
 - The Claude Code CLI, or the Claude desktop app.
 
-The plugin starts only the runtime versions that its release reviewed. After an update of the ChatGPT app changes the runtime, the plugin refuses to start, and its message names the changed package. A new release of the plugin then reviews the new runtime.
+An update of the ChatGPT app can change the runtime. The plugin starts a new runtime version when the version passes the contract checks of the plugin, and `/cua status` then reports the version as compatible and unreviewed. When a check fails, the plugin refuses to start, and its message names the contract that changed. A new release of the plugin then follows the new runtime. With `CUA_RUNTIME_PINS=strict` in the environment of Claude Code, the plugin starts only the runtime versions that its release reviewed.
 
 The plugin does not contain the OpenAI runtime. It uses the runtime that the ChatGPT app installs.
 
@@ -103,12 +120,21 @@ claude plugin uninstall cua-integration@claude-mod
 claude plugin marketplace remove claude-mod
 ```
 
+## Settings
+
+Each setting is a variable in the environment of Claude Code.
+
+- `CUA_SETTLE_MS` gives the settle time after an input to a window with no accessibility content, as a whole number of milliseconds from 0 to 10000. The default is 1000. A larger value helps when a remote desktop shows the result of an input late.
+- `CUA_CAPTURE_SCALE=0` disables the step that makes the screenshot of a large window smaller before Claude receives it. Use the value only when the screenshots of large windows fail after an update of the ChatGPT app. With the value, a call with more than one screenshot of a large window can fail after 120 seconds.
+
 ## Known limitations
 
 - A turn end reports cleanup success as unverified, because the runtime suppresses the failures of its own handlers.
 - The native service of the ChatGPT app can keep an app grant after the launcher stops. The plugin does not revoke it.
 - The agent pointer of the Computer Use service can stay on the screen after a turn. Run `/cua stop-service` or `/cua off` to stop the service and remove the pointer. The plugin also stops the service when a session that used computer use ends. A Computer Use task of the Codex app that runs at that time loses its service, so do not use computer use in the Codex app and in Claude Code at the same time.
 - In Claude Code Desktop, Esc on an approval dialog ends the turn. The dialog approves nothing.
+- A call whose result is too large does not return. It ends after 120 seconds, and the plugin starts the runtime again, so Claude binds each app again. A result has this size with about 16 megabytes of text and images together. The message of the failure names this cause.
+- For a window on a Space that no display shows, a click at a point, a drag, and a scroll fail. A click by element index and keys still reach such a window.
 
 ## Source
 

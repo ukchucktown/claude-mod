@@ -135,6 +135,7 @@ const CATEGORIES = [
   "interruption",
   "intervention",
   "accessibility",
+  "visibility",
   "protocol",
   "transport",
   "observation",

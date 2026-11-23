@@ -20,6 +20,8 @@ import type { ServiceStop } from "./service.ts";
 import type { SessionGrants } from "../policy/grants.ts";
 import { PROTOCOL_VERSION, RuntimeSupervisor } from "./supervisor.ts";
 import { failureCategory, resultCategory } from "./diagnostics.ts";
+import { noScreenshot, REGION_TOOL } from "../observations/region.ts";
+import { LAUNCHER_TOOLS, validateArguments } from "./tool-contracts.ts";
 import {
   CHECK_APP,
   CHECK_TIMEOUT_MS,
@@ -61,6 +63,12 @@ const ABANDONED =
   "The client cancelled an earlier call while it waited for app access. Steps of that script before the request may have run. Observe the current app state before further input.";
 // The runtime key of the main loop. A subagent's key is its agent ID.
 const MAIN = "";
+// The status texts for an error result of the region tool. A refusal is a
+// rule of the tool, and a failure is a failure of the image tool.
+const REGION_REFUSED =
+  "The region tool of the launcher refused the request; no app received a request.";
+const REGION_FAILED =
+  "The region tool of the launcher failed; no app received a request.";
 
 // One caller's runtime and the client requests that it serves now.
 type Runtime = {
@@ -1011,23 +1019,27 @@ export function serve(
         throw new RpcError(-32602, "Unsupported tools/list parameters");
       // The provider marks `js` read-only, although its scripts click and type.
       // A host that trusts that hint can skip its own permission prompt.
+      // The tools of the launcher itself follow the tools of the provider.
       return {
-        tools: owner
-          .catalog()
-          .filter((tool) => tool.name !== "turn_ended")
-          .map((tool) =>
-            tool.name === "js"
-              ? {
-                  ...tool,
-                  annotations: {
-                    ...(object(tool.annotations) ? tool.annotations : {}),
-                    readOnlyHint: false,
-                    destructiveHint: true,
-                    openWorldHint: true,
-                  },
-                }
-              : tool,
-          ),
+        tools: [
+          ...owner
+            .catalog()
+            .filter((tool) => tool.name !== "turn_ended")
+            .map((tool) =>
+              tool.name === "js"
+                ? {
+                    ...tool,
+                    annotations: {
+                      ...(object(tool.annotations) ? tool.annotations : {}),
+                      readOnlyHint: false,
+                      destructiveHint: true,
+                      openWorldHint: true,
+                    },
+                  }
+                : tool,
+            ),
+          ...Object.values(LAUNCHER_TOOLS),
+        ],
       };
     }
     if (request.method === "tools/call") {
@@ -1084,7 +1096,29 @@ export function serve(
       // its runtime, and its transition resets the bindings. The generation
       // that this call reads after the wait would then be the new one.
       const admitted = transitions;
-      const runtime = await runtimeFor(record?.agentId ?? MAIN);
+      // The launcher answers a call of its region tool from an image that
+      // it delivered. The call starts no runtime, replaces no failed
+      // runtime, and sends nothing to a runtime. A caller with no runtime
+      // that works received no screenshot, so it gets that refusal.
+      const region = params.name === REGION_TOOL;
+      const live = runtimes.get(record?.agentId ?? MAIN);
+      if (region && (!live || hasFailed(live))) {
+        validateArguments(REGION_TOOL, args);
+        const refused = noScreenshot();
+        try {
+          options.control?.publish({
+            lastCall: "failed",
+            error: REGION_REFUSED,
+            failure: resultCategory(refused),
+          });
+        } catch {
+          /* The control gate now fails closed. */
+        }
+        return refused;
+      }
+      const runtime = region
+        ? live!
+        : await runtimeFor(record?.agentId ?? MAIN);
       if (transitions !== admitted)
         throw new RpcError(
           -32000,
@@ -1095,30 +1129,38 @@ export function serve(
       runtime.usedAt = Date.now();
       try {
         const generation = runtime.owner.health().runtimeGeneration;
-        await runtime.owner.ready();
+        // The region tool needs no bootstrap of the runtime.
+        if (!region) await runtime.owner.ready();
         options.control?.assertEnabled();
         activeCalls++;
         try {
           options.control?.publish({ lastCall: "active" });
           publish();
-          let result = await runtime.owner.call(
-            {
-              sessionId: options.sessionId,
-              turnId: record?.turnId ?? toolUseId,
-              toolUseId,
-              ...(record?.agentId === undefined
-                ? {}
-                : { agentId: record.agentId }),
-              runtimeGeneration: generation,
-            },
-            params.name,
-            args as Record<string, Json>,
-          );
+          const caller = {
+            sessionId: options.sessionId,
+            turnId: record?.turnId ?? toolUseId,
+            toolUseId,
+            ...(record?.agentId === undefined
+              ? {}
+              : { agentId: record.agentId }),
+            runtimeGeneration: generation,
+          };
+          // The launcher answers a call of its own tool. Each other call
+          // goes to the runtime of the caller.
+          let result = region
+            ? await runtime.owner.region(caller, args as Record<string, Json>)
+            : await runtime.owner.call(
+                caller,
+                params.name,
+                args as Record<string, Json>,
+              );
           // A result of a runtime that works ends a row of recoveries, and
           // it starts with the notes of its caller. An error result of
           // `js_reset` fails its runtime. Such a result changes neither, so
           // the note and the row wait for the runtime that replaces it.
-          if (!hasFailed(runtime)) {
+          // A call of the region tool shows nothing about the runtime, so
+          // it ends no row and takes no note.
+          if (!region && !hasFailed(runtime)) {
             ledger.worked();
             const notes = abandoned.has(request.id)
               ? []
@@ -1135,9 +1177,13 @@ export function serve(
           try {
             options.control?.publish({
               lastCall: result.isError ? "failed" : "completed",
-              error: result.isError
-                ? "The runtime returned a tool error; prior effects may remain."
-                : "",
+              error: !result.isError
+                ? ""
+                : !region
+                  ? "The runtime returned a tool error; prior effects may remain."
+                  : resultCategory(result) === "failed-policy"
+                    ? REGION_REFUSED
+                    : REGION_FAILED,
               failure: result.isError
                 ? resultCategory(result, declined.has(toolUseId))
                 : "",

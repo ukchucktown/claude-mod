@@ -1,11 +1,18 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolResult } from "../contracts.ts";
 import { ConnectionError, object, nonempty } from "../connection/protocol.ts";
-import { modelImageSize, type PixelSize } from "../native/sky-guard.ts";
+import {
+  imageSize,
+  modelImageSize,
+  referencedImage,
+  type CaptureReference,
+  type PixelSize,
+} from "../native/sky-guard.ts";
 
 // nodeRepl.emitImage accepts PNG, JPEG, and WebP bytes, so a model can emit
 // each of them. Native screenshots in the feasibility runs were PNG.
@@ -306,6 +313,77 @@ export const scaleWithSips: Resample = async (bytes, { width, height }) => {
   }
 };
 
+// An image that the launcher delivered, with the bytes and the size of its
+// source and the size that the model received. The source of a screenshot
+// that the native guard scaled is its capture.
+export type DeliveredImage = Readonly<{
+  bytes: Buffer;
+  sourcePixels: PixelSize;
+  modelPixels: PixelSize;
+}>;
+
+// Reads the bytes of the capture that a reference names. A capture that the
+// launcher cannot read, and a file with another digest, give undefined.
+export type CaptureSource = (
+  reference: Pick<CaptureReference, "name" | "sha256">,
+) => Promise<Buffer | undefined>;
+
+// The name of the folder in which the native service writes each screenshot.
+// The folder is in the temporary folder of the user. The capture scale
+// record gives the source of the name.
+export const CAPTURE_FOLDER = "com.openai.sky.CUAService";
+// The largest capture that the launcher reads, in bytes.
+const CAPTURE_LIMIT_BYTES = 64 * 1024 * 1024;
+
+// Reads a capture from the screenshot folder of the native service. The
+// reference comes from the bytes of an image, which a script of the model
+// can write. Thus, the launcher reads only a regular file of this user with
+// the name of the reference in that one folder, and only a file whose bytes
+// have the digest of the reference. A script can then name only a capture
+// whose bytes it knows.
+//
+// The launcher opens the file one time and does not follow a link. It checks
+// the open file and reads from the same file, so a change of the folder
+// between the check and the read gives it no other file. It reads the number
+// of bytes of the check at most.
+export const captureFromFolder =
+  (folder: string = join(tmpdir(), CAPTURE_FOLDER)): CaptureSource =>
+  async ({ name, sha256 }) => {
+    let handle;
+    try {
+      handle = await open(
+        join(folder, name),
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      const stat = await handle.stat();
+      if (
+        !stat.isFile() ||
+        stat.uid !== process.getuid?.() ||
+        stat.size > CAPTURE_LIMIT_BYTES
+      )
+        return undefined;
+      const bytes = Buffer.alloc(stat.size);
+      let filled = 0;
+      while (filled < bytes.length) {
+        const { bytesRead } = await handle.read(
+          bytes,
+          filled,
+          bytes.length - filled,
+          filled,
+        );
+        if (bytesRead === 0) return undefined;
+        filled += bytesRead;
+      }
+      return createHash("sha256").update(bytes).digest("hex") === sha256
+        ? bytes
+        : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  };
+
 // Gives each image of a result the size that the model receives without a
 // second resize. The native guard relates a coordinate pair to that size, so
 // the launcher never delivers a larger image: an image that it cannot scale
@@ -316,28 +394,65 @@ export const scaleWithSips: Resample = async (bytes, { width, height }) => {
 // stays an image in the result. The native guard permits a coordinate pair
 // only for a screenshot with one of these digests, so an image that the
 // launcher withheld permits none.
+//
+// `last` is the last image that stays an image in the result, with its source
+// bytes. The region tool cuts a part of those bytes, so the model can read
+// that part at the resolution of the source.
+//
+// The native guard scales the screenshot of a large window before the script
+// receives it, and it writes a reference to the capture into the image. Such
+// an image is within the limits, so it passes with its bytes unchanged. Its
+// digest in `delivered` is the digest of the image without the reference,
+// which is the digest that the guard keeps for the screenshot. When it is
+// the last image, `captures` reads its capture, and the capture is the
+// source of `last`. Thus, the region tool cuts from the capture. A capture
+// that the launcher cannot read, and a capture that does not have the size
+// for the image, leave the image as its own source.
+//
+// The reference holds the digest of the image that the guard scaled. An
+// image with a reference and with other bytes is no image of the guard: its
+// digest is that of its own bytes, and the launcher reads no capture for it.
 export async function fitForDelivery(
   result: ToolResult,
   resample: Resample = scaleWithSips,
-): Promise<{ result: ToolResult; delivered: string[] }> {
+  captures: CaptureSource = captureFromFolder(),
+): Promise<{
+  result: ToolResult;
+  delivered: string[];
+  last?: DeliveredImage;
+}> {
   const records = inspectImages(result);
   const delivered: string[] = [];
+  let last: DeliveredImage | undefined;
+  // The capture reference of the last image, when that image has one.
+  let reference: CaptureReference | undefined;
   let content: ToolResult["content"] | undefined;
-  for (const { contentIndex, sha256, sourcePixels, modelPixels } of records) {
+  for (const {
+    contentIndex,
+    mimeType,
+    sha256,
+    sourcePixels,
+    modelPixels,
+  } of records) {
+    const source = Buffer.from(
+      result.content[contentIndex]!.data as string,
+      "base64",
+    );
     if (
       sourcePixels.width === modelPixels.width &&
       sourcePixels.height === modelPixels.height
     ) {
-      delivered.push(sha256);
+      const scaled =
+        mimeType === "image/jpeg" ? referencedImage(source) : undefined;
+      delivered.push(scaled?.sha256 ?? sha256);
+      last = { bytes: source, sourcePixels, modelPixels };
+      reference = scaled?.reference;
       continue;
     }
     content ??= [...result.content];
     const block = content[contentIndex]!;
     try {
-      const scaled = await resample(
-        Buffer.from(block.data as string, "base64"),
-        modelPixels,
-      );
+      const scaled = await resample(source, modelPixels);
       const next = {
         ...block,
         data: scaled.toString("base64"),
@@ -351,6 +466,11 @@ export async function fitForDelivery(
         throw new Error("The scaled image has another size");
       content[contentIndex] = next;
       delivered.push(sha256);
+      last = { bytes: source, sourcePixels, modelPixels };
+      // This image is the last image now. An image that the launcher
+      // withholds does not replace the last image, so that image keeps its
+      // reference.
+      reference = undefined;
     } catch {
       content[contentIndex] = {
         type: "text",
@@ -358,7 +478,27 @@ export async function fitForDelivery(
       };
     }
   }
-  return { result: content ? { ...result, content } : result, delivered };
+  if (last && reference) {
+    const capture = await captures(reference).catch(() => undefined);
+    const size = capture && imageSize(capture);
+    const fit = size && modelImageSize(size);
+    if (
+      capture &&
+      size &&
+      fit?.width === last.modelPixels.width &&
+      fit.height === last.modelPixels.height
+    )
+      last = {
+        bytes: capture,
+        sourcePixels: size,
+        modelPixels: last.modelPixels,
+      };
+  }
+  return {
+    result: content ? { ...result, content } : result,
+    delivered,
+    ...(last ? { last } : {}),
+  };
 }
 
 export async function fitImages(

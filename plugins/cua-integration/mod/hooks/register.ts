@@ -34,6 +34,9 @@ const TOOLS = [
   "mcp__plugin_cua-integration_cua__js",
   "mcp__plugin_cua-integration_cua__js_reset",
   "mcp__plugin_cua-integration_cua__js_add_node_module_dir",
+  // The region tool of the launcher. The launcher answers it, and the
+  // runtime does not receive it.
+  "mcp__plugin_cua-integration_cua__screenshot_region",
 ];
 const DENIED =
   "CUA is disabled or its control gate failed. Use /cua status in the interactive CLI or in Claude Code Desktop.";

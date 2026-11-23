@@ -3,6 +3,7 @@ import {
   fitForDelivery,
   validateObservationResult,
 } from "../observations/result.ts";
+import { REGION_TOOL } from "../observations/region.ts";
 import { ConnectionError, object } from "./protocol.ts";
 
 // Constraint-only schemas from the recorded discovery probe. Descriptions and
@@ -37,6 +38,41 @@ export const INPUT_SCHEMAS = {
   },
 } as const;
 export type ToolName = keyof typeof INPUT_SCHEMAS;
+
+// The tools of the launcher itself. The provider catalog does not hold them,
+// so `validateTools` does not look for them there. The launcher adds each of
+// them to the catalog for its client and answers its calls.
+export const LAUNCHER_TOOLS = {
+  [REGION_TOOL]: {
+    name: REGION_TOOL,
+    title: "Screenshot region",
+    description:
+      "Read a part of the last screenshot at the resolution of the capture. Use it when text in a screenshot is too small to read, before you change the zoom of an app. Give the rectangle in pixels of the last screenshot as you received it, from its top left corner. A small rectangle gives the most detail, and the result states how many pixels it holds for each pixel of the screenshot. The tool sends nothing to the app. The image is for reading: a coordinate pair for input stays a pixel of the full screenshot.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        x: { type: "integer", minimum: 0 },
+        y: { type: "integer", minimum: 0 },
+        width: { type: "integer", minimum: 1 },
+        height: { type: "integer", minimum: 1 },
+      },
+      required: ["x", "y", "width", "height"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+  },
+} as const;
+export type LauncherToolName = keyof typeof LAUNCHER_TOOLS;
+const schemaOf = (name: string) =>
+  Object.hasOwn(INPUT_SCHEMAS, name)
+    ? INPUT_SCHEMAS[name as ToolName]
+    : Object.hasOwn(LAUNCHER_TOOLS, name)
+      ? LAUNCHER_TOOLS[name as LauncherToolName].inputSchema
+      : undefined;
 export type Tool = {
   name: ToolName;
   inputSchema: Record<string, unknown>;
@@ -93,16 +129,15 @@ export function validateArguments(
   name: string,
   args: unknown,
 ): asserts args is Record<string, unknown> {
-  if (!Object.hasOwn(INPUT_SCHEMAS, name))
-    throw new ConnectionError("state", `Unknown tool: ${name}`);
+  const schema = schemaOf(name);
+  if (!schema) throw new ConnectionError("state", `Unknown tool: ${name}`);
   if (!object(args))
     throw new ConnectionError("state", "Tool arguments must be an object");
-  const schema = INPUT_SCHEMAS[name as ToolName];
   for (const key of Object.keys(args))
     if (!Object.hasOwn(schema.properties, key))
       throw new ConnectionError("state", `Unexpected argument: ${key}`);
   const required: readonly string[] =
-    "required" in schema ? schema.required : [];
+    "required" in schema ? (schema.required as readonly string[]) : [];
   for (const key of required)
     if (!Object.hasOwn(args, key))
       throw new ConnectionError("state", `Missing argument: ${key}`);
@@ -120,7 +155,9 @@ export function validateArguments(
       throw new ConnectionError("state", `Invalid string argument: ${key}`);
     if (
       constraint.type === "integer" &&
-      (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1)
+      (typeof value !== "number" ||
+        !Number.isSafeInteger(value) ||
+        value < ((constraint.minimum as number | undefined) ?? 1))
     )
       throw new ConnectionError("state", `Invalid integer argument: ${key}`);
   }

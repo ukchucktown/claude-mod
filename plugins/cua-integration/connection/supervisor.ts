@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
@@ -45,14 +45,63 @@ import {
   object,
   type DeadlineControl,
 } from "./protocol.ts";
-import { serverInstructions } from "./guidance.ts";
+import {
+  PIXEL_WINDOW_NOTE,
+  pixelOnlyApp,
+  RESET_NOTE,
+  RESULT_SIZE_HINT,
+  serverInstructions,
+} from "./guidance.ts";
+import { CAPTURE_SCALE_ENV, SETTLE_ENV } from "../native/sky-guard.ts";
 import { readDisplayScales, type DisplayReader } from "./displays.ts";
 import {
+  REGION_TOOL,
+  regionResult,
+  type Crop,
+} from "../observations/region.ts";
+import type { CaptureSource, DeliveredImage } from "../observations/result.ts";
+import {
   fitResult,
+  LAUNCHER_TOOLS,
   validateArguments,
   validateResult,
   type Tool,
 } from "./tool-contracts.ts";
+
+// The setting for the settle time of a window with no accessibility content,
+// in milliseconds. A person sets it in the environment of Claude Code, as
+// the other settings of the launcher. The default time is `SETTLE_MS` of the
+// guard.
+export const SETTLE_SETTING = "CUA_SETTLE_MS";
+// The environment entry that gives the setting to the guard of a runtime.
+// The guard checks the value: a value that is no whole number from 0 to
+// 10000 gives the default time. With no setting, the guard gets no entry and
+// uses the default time.
+export function settleEnvironment(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const value = env[SETTLE_SETTING];
+  return value === undefined ? {} : { [SETTLE_ENV]: value };
+}
+
+// The setting that turns the scale step of the native guard off. A person
+// sets it in the environment of Claude Code, as the other settings of the
+// launcher. With the value 0, the guard gives each script the capture of a
+// screenshot, and the launcher scales it after the result arrived. A person
+// uses the value when a version of the runtime no longer accepts the
+// screenshot that the guard scaled (decision record 0009).
+export const CAPTURE_SCALE_SETTING = "CUA_CAPTURE_SCALE";
+// The environment entry that gives the setting to the guard of a runtime.
+// With no setting, the guard gets no entry and keeps the scale step.
+export function captureScaleEnvironment(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const value = env[CAPTURE_SCALE_SETTING];
+  return value === undefined ? {} : { [CAPTURE_SCALE_ENV]: value };
+}
+
+const digestOf = (text: string) =>
+  createHash("sha256").update(text).digest("hex");
 
 // The MCP version that the launcher speaks to its client. The Codex host
 // speaks MCP to the runtime, and the launcher does not see that version.
@@ -94,6 +143,12 @@ export type SupervisorOptions = {
   delivery?: string;
   // Scales an image above the model limits. The macOS image tool when absent.
   resample?: Resample;
+  // Reads the capture of a screenshot that the native guard scaled. The
+  // screenshot folder of the native service when absent.
+  captures?: CaptureSource;
+  // Cuts a rectangle from an image for the region tool. The macOS image tool
+  // when absent.
+  crop?: Crop;
   // Reads the scale of each display for the delivery record. The macOS
   // system report when absent.
   displays?: DisplayReader;
@@ -108,6 +163,9 @@ export const DISPLAY_CACHE_MS = 5000;
 // far behind in the conversation, so a coordinate pair for it needs a new
 // observation.
 export const DELIVERY_LIMIT = 32;
+// How many apps of one conversation get the note for a window with no
+// accessibility content.
+export const PIXEL_NOTE_LIMIT = 32;
 type Execution = {
   id: string;
   caller: Caller;
@@ -183,6 +241,20 @@ export class RuntimeSupervisor implements ConnectionOwner {
   // The digests of the last images that this supervisor delivered, oldest
   // first.
   private deliveredImages: string[] = [];
+  // The last image that this supervisor delivered, with its source bytes.
+  // The region tool cuts its rectangle from these bytes. A conversation
+  // transition removes the image, because it belongs to the old conversation.
+  private lastImage: DeliveredImage | undefined;
+  // The apps for which this supervisor gave the note for a window with no
+  // accessibility content. Each app gets the note one time in a
+  // conversation.
+  private pixelNoted = new Set<string>();
+  // The digest of each text block of the documentation that the runtime
+  // printed at a bootstrap, and the digests that the model received in this
+  // conversation. The runtime prints the same text again after it reset its
+  // script state, and the launcher then gives a short note in its place.
+  private documentation = new Set<string>();
+  private documentationDelivered = new Set<string>();
   // The last reading of the display scales, with its time. `scales` is null
   // when the read failed.
   private displays: {
@@ -322,16 +394,17 @@ export class RuntimeSupervisor implements ConnectionOwner {
       (options.ownership
         ? deliveryPath(connection, dirname(options.ownership.path))
         : undefined);
-    const host = RUNTIME.launch(
-      spec,
-      options.ownership
+    const host = RUNTIME.launch(spec, {
+      ...(options.ownership
         ? {
             [OWNERSHIP_ENV]: options.ownership.path,
             [CONNECTION_ENV]: connection,
             ...(delivery === undefined ? {} : { [DELIVERY_ENV]: delivery }),
           }
-        : {},
-    );
+        : {}),
+      ...settleEnvironment(),
+      ...captureScaleEnvironment(),
+    });
     let supervisor: RuntimeSupervisor;
     try {
       supervisor = new RuntimeSupervisor(host, {
@@ -407,6 +480,9 @@ export class RuntimeSupervisor implements ConnectionOwner {
       );
     this.available();
     this.banner = result.content;
+    for (const block of result.content)
+      if (block.type === "text" && typeof block.text === "string")
+        this.documentation.add(digestOf(block.text));
     this.state = "ready";
   }
   private deadlineFor(tool: string, args: Record<string, Json>): number {
@@ -449,6 +525,60 @@ export class RuntimeSupervisor implements ConnectionOwner {
         "Unknown caller identity or stale runtime generation",
       );
   }
+  // The region tool of the launcher. The call does not reach the runtime and
+  // needs no lease, because it sends nothing to an app: it cuts a rectangle
+  // from the source bytes of the last image that this supervisor delivered.
+  // The call waits behind each earlier call of the caller, so it reads the
+  // image of the last result. It has the caller checks and the replay check
+  // of each other call.
+  async region(
+    caller: Caller,
+    args: Record<string, Json>,
+  ): Promise<ToolResult> {
+    // The tool needs no runtime, so it answers in each state of a runtime
+    // that did not fail or stop, also before the bootstrap of the runtime
+    // and after a conversation transition.
+    this.available();
+    this.validateCaller(caller);
+    validateArguments(REGION_TOOL, args);
+    const key = caller.toolUseId;
+    if (this.usedCalls.has(key))
+      throw new ConnectionError(
+        "state",
+        "Caller tool-use identity was already submitted; no automatic replay",
+      );
+    this.usedCalls.add(key);
+    // The cut and the scale step can each run for seconds, and each later
+    // call of the caller waits behind this call. Thus, the limit for the
+    // calls that wait in one runtime applies to this tool also.
+    if (this.queued > (this.options.queueLimit ?? RUNTIME_QUEUE_LIMIT))
+      throw new ConnectionError(
+        "state",
+        `${this.queued} calls of this caller already run or wait; this call did not run`,
+      );
+    this.queued++;
+    const savedCaller = Object.freeze({ ...caller });
+    const { x, y, width, height } = args as Record<string, number>;
+    const work = this.tail.then(async () => {
+      this.available();
+      this.validateCaller(savedCaller);
+      this.options.beforeDispatch?.();
+      const result = await regionResult(
+        this.lastImage,
+        { x: x!, y: y!, width: width!, height: height! },
+        this.options.crop,
+        this.options.resample,
+      );
+      // The image tool can run for seconds, and the runtime can fail or the
+      // conversation can end in that time.
+      this.available();
+      this.validateCaller(savedCaller);
+      return result;
+    });
+    const settled = work.finally(() => this.queued--);
+    this.tail = settled.catch(() => {});
+    return settled;
+  }
   // `underLease` runs after this runtime took the lease and before the call
   // reaches the runtime. The native check opens its document there, so the
   // document appears only while this runtime may act on the desktop.
@@ -467,6 +597,12 @@ export class RuntimeSupervisor implements ConnectionOwner {
       throw new ConnectionError(
         "state",
         "turn_ended is reserved for host lifecycle delivery",
+      );
+    // The launcher answers its own tools, and the runtime does not have them.
+    if (Object.hasOwn(LAUNCHER_TOOLS, tool))
+      throw new ConnectionError(
+        "state",
+        `${tool} is a tool of the launcher, and the runtime does not receive it`,
       );
     const key = caller.toolUseId;
     if (this.usedCalls.has(key))
@@ -609,7 +745,7 @@ export class RuntimeSupervisor implements ConnectionOwner {
       // A result with an image also needs a reading of the display scales
       // for the delivery record. The two steps run at the same time.
       const [fitted] = await Promise.all([
-        fitResult(result, this.options.resample),
+        fitResult(result, this.options.resample, this.options.captures),
         result.content.some((block) => block.type === "image")
           ? this.readDisplays()
           : undefined,
@@ -618,6 +754,16 @@ export class RuntimeSupervisor implements ConnectionOwner {
       // time. A failed runtime returns no result.
       this.available();
       result = fitted.result;
+      // The region tool reads the last image that the model received. The
+      // server sends no result of a call that its client abandoned, and a
+      // call that a conversation transition retired belongs to the old
+      // conversation, so the image of neither call becomes the last image.
+      if (
+        fitted.last &&
+        !this.abandoned.has(savedCaller.toolUseId) &&
+        savedCaller.runtimeGeneration === this.generation
+      )
+        this.lastImage = fitted.last;
       if (execution.refusals.length > 0)
         result = {
           ...result,
@@ -632,6 +778,39 @@ export class RuntimeSupervisor implements ConnectionOwner {
       if (this.banner.length > 0) {
         result = { ...result, content: [...this.banner, ...result.content] };
         this.banner = [];
+      }
+      // The model receives the documentation of the runtime one time in a
+      // conversation. A later copy becomes one short note, which tells the
+      // model that the script state is gone. A script that asks for the
+      // documentation gets it, and so does a call whose result the model
+      // does not receive.
+      if (
+        !this.abandoned.has(savedCaller.toolUseId) &&
+        savedCaller.runtimeGeneration === this.generation &&
+        !(
+          tool === "js" &&
+          typeof savedArgs.code === "string" &&
+          savedArgs.code.includes("rewriteDocumentation")
+        )
+      ) {
+        let noted = false;
+        const content: ToolResult["content"] = [];
+        for (const block of result.content) {
+          const digest =
+            block.type === "text" && typeof block.text === "string"
+              ? digestOf(block.text)
+              : undefined;
+          if (digest === undefined || !this.documentation.has(digest)) {
+            content.push(block);
+          } else if (!this.documentationDelivered.has(digest)) {
+            this.documentationDelivered.add(digest);
+            content.push(block);
+          } else if (!noted) {
+            noted = true;
+            content.push({ type: "text", text: RESET_NOTE });
+          }
+        }
+        if (noted) result = { ...result, content };
       }
       if (tool === "js_reset") {
         if (result.isError)
@@ -650,12 +829,59 @@ export class RuntimeSupervisor implements ConnectionOwner {
       // the model does not receive the images of such a call.
       if (!this.abandoned.has(savedCaller.toolUseId))
         this.recordDelivery(fitted.delivered);
+      // The first result of a conversation that shows a window with no
+      // accessibility content starts with the note for such a window. An
+      // abandoned call and a call of the old conversation give no note,
+      // because the model does not receive their results.
+      if (
+        !this.abandoned.has(savedCaller.toolUseId) &&
+        savedCaller.runtimeGeneration === this.generation
+      ) {
+        // The note is a constant text, and the app name of a block is only
+        // a key. The set of keys has a limit, so a row of results with new
+        // names cannot grow it.
+        let note = false;
+        for (const block of result.content) {
+          if (block.type !== "text" || typeof block.text !== "string") continue;
+          const app = pixelOnlyApp(block.text);
+          if (
+            app === undefined ||
+            this.pixelNoted.has(app) ||
+            this.pixelNoted.size >= PIXEL_NOTE_LIMIT
+          )
+            continue;
+          this.pixelNoted.add(app);
+          note = true;
+        }
+        if (note)
+          result = {
+            ...result,
+            content: [
+              { type: "text", text: PIXEL_WINDOW_NOTE },
+              ...result.content,
+            ],
+          };
+      }
       return result;
     } catch (error) {
       // A protocol error has no trustworthy kernel recovery contract. A content
       // failure arrived in a valid, correlated response, so only the call fails.
       if (!(error instanceof ConnectionError && error.kind === "content"))
         this.fail(error instanceof Error ? error : new Error(String(error)));
+      // The runtime ends a script at its own time limit, which is shorter
+      // than the transport deadline. Thus, a `js` call that reaches the
+      // transport deadline has a result that did not arrive, and the failure
+      // names the one cause that a record shows.
+      if (
+        tool === "js" &&
+        error instanceof ConnectionError &&
+        error.kind === "timeout"
+      )
+        throw new ConnectionError(
+          "timeout",
+          `${error.message} ${RESULT_SIZE_HINT}`,
+          error.details,
+        );
       throw error;
     } finally {
       this.expire(execution);
@@ -983,6 +1209,7 @@ export class RuntimeSupervisor implements ConnectionOwner {
   // or approval of the old conversation may act in the new one.
   private transition(reason: string): Promise<string> {
     this.retire();
+    this.lastImage = undefined;
     // The running call belongs to the old conversation. The reset waits
     // behind it, so a call that does not end in time fails the runtime.
     const retired = this.active;
@@ -999,6 +1226,12 @@ export class RuntimeSupervisor implements ConnectionOwner {
       timer.unref();
     }
     const work = this.tail.then(async () => {
+      // The running call of the old conversation ended. Its image is no
+      // image of the new conversation, and the new conversation did not
+      // receive a note of the old one.
+      this.lastImage = undefined;
+      this.pixelNoted.clear();
+      this.documentationDelivered.clear();
       // A runtime that stopped has no bindings to discard.
       if (this.state === "failed" || this.state === "stopped")
         return `Conversation ${reason}: reset skipped, because the runtime stopped (${this.failure?.message ?? "closed"})`;

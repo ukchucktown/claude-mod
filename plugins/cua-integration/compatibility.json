@@ -1,5 +1,5 @@
 {
-  "adapterVersion": "0.3.3",
+  "adapterVersion": "0.4.0",
   "nodeBaseline": "24.21.0",
   "nodeMajors": {
     "minimum": 24,
@@ -59,14 +59,14 @@
       "result": "pass",
       "host": "Interactive Claude Code CLI on local macOS",
       "clientVersion": "2.1.330",
-      "runtimePluginVersion": "26.1117.31558",
+      "runtimePluginVersion": "26.1117.41037",
       "packages": {
         "@oai/cua-repl": "0.1.6",
         "@oai/cua": "0.2.8",
         "@oai/sky": "0.7.24",
         "codex-cli": "0.171.0-alpha.13"
       },
-      "appVersion": "26.1117.31558"
+      "appVersion": "26.1117.41037"
     }
   ],
   "feasibilityOnly": {
