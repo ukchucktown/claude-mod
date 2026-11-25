@@ -509,6 +509,42 @@ async function prepare(
   }
 }
 
+// The complete message of an observation that the native service ended at
+// its own time limit. The duplicate process record of issue #140 shows it
+// for an app whose first process has no window.
+const TIMEOUT_REACHED = /^Computer Use server error -?\d+: timeoutReached$/;
+// The longest selector of an app that the notice names.
+const SELECTOR_LIMIT = 200;
+const NOTICE_START = " The observation of the app ";
+const NOTICE_END =
+  " ended at the time limit of the native service. One known cause is a process of the app that has no window.";
+const TIME_LIMIT_LABEL = "timeoutReached [unknown: unknownError]";
+// The text that the guard adds to that failure. It names the selector that
+// the caller gave, because the trusted worker cannot read the processes of
+// an app: the launcher reads them for the selector of a notice at the end
+// of a result, and adds its own note.
+export const timeLimitNotice = (app: string) =>
+  `${NOTICE_START}${JSON.stringify(app.slice(0, SELECTOR_LIMIT))}${NOTICE_END}`;
+// The selector in the notice at the end of a text, or undefined. A notice
+// at another place of a text can come from the content of an app, so the
+// launcher does not read it.
+export function timeLimitApp(text: string): string | undefined {
+  const trimmed = text.trimEnd();
+  if (!trimmed.endsWith(NOTICE_END)) return undefined;
+  const body = trimmed.slice(0, -NOTICE_END.length);
+  const start = body.lastIndexOf(NOTICE_START);
+  if (start < 0 || !body.slice(0, start).endsWith(TIME_LIMIT_LABEL))
+    return undefined;
+  try {
+    const app: unknown = JSON.parse(body.slice(start + NOTICE_START.length));
+    return typeof app === "string" && app !== "" && app.length <= SELECTOR_LIMIT
+      ? app
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class NativeGuardError extends Error {
   readonly category: FailureCategory;
   readonly code: string | undefined;
@@ -879,11 +915,25 @@ export function createSkyGuard(
   // An observation that fails names no canonical app path. After a user
   // intervention, each bound app can differ from its last observation, so
   // each one waits for a new observation.
-  const observe = async (request: unknown): Promise<unknown> => {
+  // `app` is the selector of an observation of one app.
+  const observe = async (request: unknown, app?: string): Promise<unknown> => {
     try {
       return await inner(request);
     } catch (error) {
-      const relabeled = relabel(error, false);
+      let relabeled = relabel(error, false);
+      if (
+        app !== undefined &&
+        relabeled.category === "unknown" &&
+        relabeled.code === "unknownError" &&
+        error instanceof Error &&
+        TIMEOUT_REACHED.test(error.message)
+      )
+        relabeled = new NativeGuardError(
+          relabeled.category,
+          `${relabeled.message}${timeLimitNotice(app)}`,
+          relabeled.code,
+          error,
+        );
       if (relabeled.category === "intervention") {
         intervened = ++sequence;
         for (const marks of apps.values())
@@ -932,7 +982,7 @@ export function createSkyGuard(
         }
       }
       const start = ++sequence;
-      const observed = await observe(request);
+      const observed = await observe(request, app);
       if (!plain(observed) || typeof observed.app !== "string" || !observed.app)
         throw new NativeGuardError(
           "observation",

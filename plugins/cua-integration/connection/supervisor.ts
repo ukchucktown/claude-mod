@@ -47,13 +47,19 @@ import {
 } from "./protocol.ts";
 import {
   PIXEL_WINDOW_NOTE,
+  duplicateProcessNote,
   pixelOnlyApp,
   RESET_NOTE,
   RESULT_SIZE_HINT,
   serverInstructions,
 } from "./guidance.ts";
-import { CAPTURE_SCALE_ENV, SETTLE_ENV } from "../native/sky-guard.ts";
+import {
+  CAPTURE_SCALE_ENV,
+  SETTLE_ENV,
+  timeLimitApp,
+} from "../native/sky-guard.ts";
 import { readDisplayScales, type DisplayReader } from "./displays.ts";
+import { readAppProcesses, type AppProcessReader } from "./app-processes.ts";
 import {
   REGION_TOOL,
   regionResult,
@@ -154,6 +160,10 @@ export type SupervisorOptions = {
   displays?: DisplayReader;
   // How long the supervisor uses one reading of the display scales again.
   displayCacheMs?: number;
+  // Reads the processes of an app whose observation ended at the time limit
+  // of the native service. The list of the running apps and the process
+  // table of macOS when absent.
+  processes?: AppProcessReader;
 };
 // How long the supervisor uses one reading of the display scales again. The
 // call that sends a coordinate pair often follows its observation at once,
@@ -861,6 +871,36 @@ export class RuntimeSupervisor implements ConnectionOwner {
               ...result.content,
             ],
           };
+      }
+      // A result that ends with the notice of the guard for an observation
+      // that ended at the time limit of the native service names the
+      // selector of the app. The launcher reads the processes of that app
+      // one time for a result. With more than one process, the result gets
+      // a note with the process IDs. The selector is a key for the read
+      // only, and the note holds no word of the result. A read that fails,
+      // and one process or none, give no note.
+      if (tool === "js" && !this.abandoned.has(savedCaller.toolUseId)) {
+        let app: string | undefined;
+        for (const block of result.content) {
+          if (block.type !== "text" || typeof block.text !== "string") continue;
+          app = timeLimitApp(block.text);
+          if (app !== undefined) break;
+        }
+        if (app !== undefined) {
+          const pids = await (this.options.processes ?? readAppProcesses)(
+            app,
+          ).catch(() => undefined);
+          // The read takes time, and the host can exit in that time.
+          this.available();
+          if (pids !== undefined && pids.length > 1)
+            result = {
+              ...result,
+              content: [
+                ...result.content,
+                { type: "text", text: duplicateProcessNote(pids) },
+              ],
+            };
+        }
       }
       return result;
     } catch (error) {

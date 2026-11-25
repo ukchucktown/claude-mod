@@ -135,6 +135,7 @@ Each setting is a variable in the environment of Claude Code.
 - In Claude Code Desktop, Esc on an approval dialog ends the turn. The dialog approves nothing.
 - A call whose result is too large does not return. It ends after 120 seconds, and the plugin starts the runtime again, so Claude binds each app again. A result has this size with about 16 megabytes of text and images together. The message of the failure names this cause.
 - For a window on a Space that no display shows, a click at a point, a drag, and a scroll fail. A click by element index and keys still reach such a window.
+- When an app runs as more than one process, Claude observes the process that started first. When that process has no window, each observation of the app fails after about 5 seconds, and the failure names the process IDs. Quit the process with no window, or quit the app and start it again. A viewer of a remote desktop that started with no session is such a process.
 
 ## Source
 

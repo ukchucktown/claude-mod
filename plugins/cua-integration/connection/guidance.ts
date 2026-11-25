@@ -237,6 +237,18 @@ export function pixelOnlyApp(text: string): string | undefined {
   return header[1]!.slice(0, APP_KEY_LIMIT);
 }
 
+const listed = (pids: readonly number[]) =>
+  pids.length < 3
+    ? pids.join(" and ")
+    : `${pids.slice(0, -1).join(", ")}, and ${pids.at(-1)}`;
+// The note of the launcher for an observation that ended at the time limit
+// of the native service while more than one process of the app ran. The
+// process IDs come from the launcher, in the order of the start of each
+// process, and the note holds no word of a result. The launcher stops no
+// process, because it cannot know what a process of the person holds.
+export const duplicateProcessNote = (pids: readonly number[]) =>
+  `Note of the launcher: ${pids.length} processes of the app of this failure run, with the process IDs ${listed(pids)}, in the order of their start. In the duplicate process record, the native service observed the process that started first, and the observation ended at the time limit when that process had no window. Do not repeat the observation. Ask the user to look at process ${pids[0]}: when it shows no window, the user can quit it, or quit the app and start it again, so that one process runs.`;
+
 // The size of one result at which the result does not arrive, in megabytes
 // of 1024 by 1024 characters.
 export const RESULT_LIMIT_MEGABYTES = RESULT_LIMIT_CHARACTERS / (1024 * 1024);
