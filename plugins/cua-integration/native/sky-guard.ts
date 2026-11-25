@@ -509,6 +509,47 @@ async function prepare(
   }
 }
 
+// An app that shows the session of another computer and that the guard does
+// not start. The native service starts an app that does not run when it
+// receives an observation of that app. The viewer start record of issue #144
+// shows that such a start of Citrix Viewer gives a process with no session
+// and no window, which does not exit, and each later observation of the
+// viewer then ends at the time limit of the native service. The list has
+// the one app of that record.
+const SESSION_VIEWERS: ReadonlyArray<{ id: string; name: string }> = [
+  { id: "com.citrix.receiver.icaviewer.mac", name: "Citrix Viewer" },
+];
+// The viewer that a selector names, by its bundle identifier, by its name,
+// or by a path that ends with the name of its bundle.
+function sessionViewer(app: string) {
+  const lower = app.toLowerCase();
+  return SESSION_VIEWERS.find(
+    ({ id, name }) =>
+      app === id ||
+      lower === name.toLowerCase() ||
+      lower.endsWith(`/${name.toLowerCase()}.app`),
+  );
+}
+// Tells whether the app list of the native service shows a process of the
+// app that runs. The list is an array of entries with an `id`, and an entry
+// of a process that runs has `isRunning: true`. An empty list and a value
+// of another form give undefined, because they show nothing about the app.
+export function listedAsRunning(
+  list: unknown,
+  id: string,
+): boolean | undefined {
+  if (
+    !Array.isArray(list) ||
+    list.length === 0 ||
+    !list.every((entry) => plain(entry) && typeof entry.id === "string")
+  )
+    return undefined;
+  return list.some((entry) => entry.id === id && entry.isRunning === true);
+}
+// The refusal of an observation that would start a viewer.
+export const viewerRefusal = (name: string) =>
+  `Computer Use refused: no process of ${name} runs. An observation would start a viewer with no remote desktop, which shows no window, and each later observation of the viewer then ends at the time limit of the native service. Ask the user to open the remote desktop, and observe the viewer after the user confirms it.`;
+
 // The complete message of an observation that the native service ended at
 // its own time limit. The duplicate process record of issue #140 shows it
 // for an app whose first process has no window.
@@ -963,6 +1004,24 @@ export function createSkyGuard(
     if (typeof app !== "string" || app.trim() === "")
       return refuse(`${method} requires an app`);
     if (method === "get_app_state") {
+      // An observation of a session viewer passes only when the app list of
+      // the native service shows a process of the viewer that runs. The
+      // read of the list is a request of its own, and it starts no app.
+      // When the read fails, and when the list has another form, the guard
+      // knows nothing about the viewer, and the observation passes.
+      const viewer = sessionViewer(app);
+      if (viewer) {
+        let listed: unknown;
+        try {
+          listed = await observe({ ...request, method: "list_apps", args: [] });
+        } catch {
+          listed = undefined;
+        }
+        if (listedAsRunning(listed, viewer.id) === false)
+          throw new NativeGuardError("refused", viewerRefusal(viewer.name));
+        // Another runtime can take the lease during the read.
+        epoch = owner();
+      }
       // After an input to a window with no accessibility content, the
       // content gets the settle time before the observation. The guard sends
       // one observation, as for each other window, so the wait asks for no

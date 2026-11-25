@@ -1,5 +1,5 @@
 {
-  "adapterVersion": "0.4.2",
+  "adapterVersion": "0.4.3",
   "nodeBaseline": "24.21.0",
   "nodeMajors": {
     "minimum": 24,

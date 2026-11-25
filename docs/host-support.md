@@ -30,7 +30,7 @@ A managed policy has more authority than the plugin:
 
 ## Tested versions
 
-The release acceptance of version 0.4.2 used these versions:
+The release acceptance of version 0.4.3 used these versions:
 
 | Component            | Version                                                                                                                |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
