@@ -30,15 +30,15 @@ A managed policy has more authority than the plugin:
 
 ## Tested versions
 
-The release acceptance of version 0.4.0 used these versions:
+The release acceptance of version 0.4.1 used these versions:
 
-| Component            | Version                                                                                                              |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Claude Code CLI      | 2.1.330                                                                                                              |
-| Google Chrome        | 158.0.8127.37, the only browser of the acceptance                                                                    |
-| Claude Desktop       | None. No acceptance ran in Desktop with this start of the runtime                                                    |
-| Computer Use runtime | 26.1117.41037, with `@oai/cua-repl` 0.1.6, `@oai/cua` 0.2.8, and `@oai/sky` 0.7.24, under Codex CLI 0.171.0-alpha.13 |
-| macOS                | 27.2.1                                                                                                               |
-| Node                 | 24.19.0                                                                                                              |
+| Component            | Version                                                                                                                |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Claude Code CLI      | 2.1.332                                                                                                                |
+| Google Chrome        | 158.0.8127.89, the only browser of the acceptance                                                                      |
+| Claude Desktop       | None. No acceptance ran in Desktop with this start of the runtime                                                      |
+| Computer Use runtime | 26.1120.41243, with `@oai/cua-repl` 0.1.6, `@oai/cua` 0.2.8, and `@oai/sky` 0.7.26, under Codex CLI 0.171.0-alpha.13.2 |
+| macOS                | 27.2.1                                                                                                                 |
+| Node                 | 24.21.0                                                                                                                |
 
 The plugin starts only these runtime package versions. Other Claude Code versions run the plugin, but the release acceptance did not cover them.

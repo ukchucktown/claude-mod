@@ -166,6 +166,7 @@ const ENV_KEYS = new Set([
   "CODEX_CLI_PATH",
   "CUA_REPL_ENABLED_SURFACES",
   "CUA_REPL_OMIT_CONFIRMATION_POLICY",
+  "CUA_REPL_CONFIRMATION_POLICY_CONFIG",
   "NODE_REPL_LAZY_TRUSTED_WORKER",
   "NODE_REPL_JS_BANNER",
   "NODE_REPL_JS_COMPLETION_SUMMARY",
@@ -190,6 +191,7 @@ const REVIEWED_UNTRUSTED_ENV = new Set([
   "CUA_REPL_ENABLED_SURFACES",
   "CUA_REPL_BROWSER_ENV",
   "CUA_REPL_OMIT_CONFIRMATION_POLICY",
+  "CUA_REPL_CONFIRMATION_POLICY_CONFIG",
 ]);
 function parsed(value: string): unknown {
   try {
@@ -272,6 +274,18 @@ const ENV_CONTRACTS: Readonly<
     return sku === undefined
       ? undefined
       : `the confirmation policy text would be omitted for ${sku || "an empty name"}`;
+  },
+  // A map from a policy key to text, which runtime plugin 26.1120.41243
+  // added. For a turn of one product SKU, the banner import replaces the
+  // confirmation policy text that the model reads with a text of this map.
+  // Discovery accepts the declared entry and does not pass it on, so the
+  // contract is the structure only.
+  CUA_REPL_CONFIRMATION_POLICY_CONFIG: (value) => {
+    const policy = parsed(value);
+    return object(policy) &&
+      Object.values(policy).every((text) => typeof text === "string")
+      ? undefined
+      : "the value is not a JSON object in which each value is text";
   },
   NODE_REPL_JS_COMPLETION_SUMMARY: (value) => {
     const summary = parsed(value);
@@ -377,16 +391,28 @@ function profileToolOverrides(
     instructions: { source: "provider-sources", surfaces: ENABLED_SURFACES },
   };
 }
-// The completion summary asks the model for a `js` call with a
-// `completion_summary` argument, which the reviewed `js` schema does not
-// have. Discovery accepts the declared entry and does not pass it on.
-const ENV_NOT_FORWARDED = new Set(["NODE_REPL_JS_COMPLETION_SUMMARY"]);
+// The entries that discovery accepts and does not pass on. The completion
+// summary asks the model for a `js` call with a `completion_summary`
+// argument, which the reviewed `js` schema does not have. A text of the
+// confirmation policy configuration can replace the confirmation policy text
+// that the model reads, so the runtime keeps its own text.
+const ENV_NOT_FORWARDED = new Set([
+  "NODE_REPL_JS_COMPLETION_SUMMARY",
+  "CUA_REPL_CONFIRMATION_POLICY_CONFIG",
+]);
 
 // The script of the declared launcher command, as runtime 26.1111.21308
 // declares it. It exports one variable with its inherited value, or empty,
 // and then runs the executable that follows the name `cua-repl`.
 export const REVIEWED_WRAPPER_SCRIPT =
   'export BROWSER_USE_ACCESS_EXECUTOR_ID="${BROWSER_USE_ACCESS_EXECUTOR_ID-}"; exec "$@"';
+// The one argument of `node_repl` in the direct launcher form, as runtime
+// 26.1120.41243 declares it. With this option, `node_repl` requires an
+// authorization of its host for browser access, also when it has no executor
+// identity. The other option of `node_repl`, `--disable-sandbox`, starts the
+// kernel without the Codex CLI, so it is in no reviewed form.
+export const REVIEWED_DIRECT_ARGUMENT = "--require-browser-access";
+const LAUNCHER_FORMS = `Changed launcher form: expected the node_repl executable with the argument ${REVIEWED_DIRECT_ARGUMENT}, or /bin/sh with the arguments -c, the wrapper script, cua-repl, and the node_repl executable`;
 // The Apple team identifier of OpenAI in a Developer ID signature.
 export const OPENAI_TEAM = "2DC432GLL2";
 // True when the file or bundle has a valid Developer ID signature of the
@@ -598,28 +624,36 @@ function checkConfiguration(
     return fail("Missing cua_repl server configuration");
   const server = config.mcpServers.cua_repl;
   if (server.enabled === false) return fail("CUA server is disabled");
-  // The launcher form is a contract: `/bin/sh -c` runs the reviewed wrapper
-  // script, which starts `node_repl`. The Codex host starts this command, so
-  // each difference refuses, and the message names the difference.
+  // The launcher form is a contract with two reviewed forms. In the wrapper
+  // form, `/bin/sh -c` runs the reviewed wrapper script, which starts
+  // `node_repl`. In the direct form, the command is `node_repl` with the one
+  // reviewed argument. The Codex host starts this command, so each
+  // difference refuses, and the message names the difference.
   const declared: unknown[] = Array.isArray(server.args) ? server.args : [];
+  const wrapper = server.command === "/bin/sh";
   if (
-    server.command !== "/bin/sh" ||
-    declared.length !== 4 ||
-    declared[0] !== "-c" ||
-    declared[2] !== "cua-repl"
+    wrapper
+      ? declared.length !== 4 ||
+        declared[0] !== "-c" ||
+        declared[2] !== "cua-repl"
+      : declared.length !== 1 || declared[0] !== REVIEWED_DIRECT_ARGUMENT
   )
-    return unsupported(
-      "Changed launcher form: expected /bin/sh with the arguments -c, the wrapper script, cua-repl, and the node_repl executable",
-    );
-  if (declared[1] !== REVIEWED_WRAPPER_SCRIPT)
+    return unsupported(LAUNCHER_FORMS);
+  if (wrapper && declared[1] !== REVIEWED_WRAPPER_SCRIPT)
     return unsupported(
       "Changed launcher form: the wrapper script differs from the reviewed script text",
     );
-  const command = path(server.command, "Launcher shell", true);
-  const entry = path(declared[3], "Runtime executable", true);
+  const entry = path(
+    wrapper ? declared[3] : server.command,
+    "Runtime executable",
+    true,
+  );
+  const command = wrapper
+    ? path(server.command, "Launcher shell", true)
+    : entry;
   if (basename(entry) !== "node_repl")
     return unsupported(
-      `Changed launcher form: the wrapper starts ${basename(entry)}, not node_repl`,
+      `Changed launcher form: the ${wrapper ? "wrapper starts" : "command is"} ${basename(entry)}, not node_repl`,
     );
   if (!object(server.env)) return fail("Missing declared runtime environment");
   // The Codex host and the runtime receive a fixed search path and these

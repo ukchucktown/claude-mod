@@ -1,5 +1,5 @@
 {
-  "adapterVersion": "0.4.0",
+  "adapterVersion": "0.4.1",
   "nodeBaseline": "24.21.0",
   "nodeMajors": {
     "minimum": 24,
@@ -45,6 +45,11 @@
       "clientVersion": "2.1.330",
       "sha256": "c41b7f1ac2fac7a6b90bc50b7a78ad1dc791778a71cedcd87dd3b34c75b89748",
       "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.330 writes beside a plugin that it loads. The Mod type-checks against it. No copy of the 2.1.329 set was available, so no comparison of the two texts exists."
+    },
+    {
+      "clientVersion": "2.1.332",
+      "sha256": "6b4affdbfe1dac358012190d564fa5c29e996df96c58e658fc9667e293c77343",
+      "source": ".claude-plugin/types/claude-code/index.d.ts, which Claude Code 2.1.332 writes beside a plugin that it loads. The Mod type-checks against it. Against 2.1.330, it adds the `anchor`, `mono`, and `blur` properties of a Box, the `Beneath` type, types for the context breakdown, the hook input `PreSkillShellCommand`, render components, the operations `fs.stat` and `fs.exists`, an optional second argument of `$.ui.invalidate`, and optional members of a command, a tool, and the session facts, and it changes comments. The Mod uses none of these."
     }
   ],
   "runtimePackages": {
@@ -58,15 +63,15 @@
       "record": "docs/implementation/cli-acceptance.json",
       "result": "pass",
       "host": "Interactive Claude Code CLI on local macOS",
-      "clientVersion": "2.1.330",
-      "runtimePluginVersion": "26.1117.41037",
+      "clientVersion": "2.1.332",
+      "runtimePluginVersion": "26.1120.41243",
       "packages": {
         "@oai/cua-repl": "0.1.6",
         "@oai/cua": "0.2.8",
-        "@oai/sky": "0.7.24",
-        "codex-cli": "0.171.0-alpha.13"
+        "@oai/sky": "0.7.26",
+        "codex-cli": "0.171.0-alpha.13.2"
       },
-      "appVersion": "26.1117.41037"
+      "appVersion": "26.1120.41243"
     }
   ],
   "feasibilityOnly": {
